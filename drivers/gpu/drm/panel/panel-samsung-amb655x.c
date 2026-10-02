@@ -124,9 +124,9 @@ static int samsung_amb655x_on(struct samsung_amb655x *amb655x)
 	/* refresh rate Transition */
 	mipi_dsi_dcs_write_long_multi(&ctx, 0xf0, 0x5a, 0x5a);
 	/* 60 Hz */
-	mipi_dsi_dcs_write_long_multi(&ctx, 0x60, 0x00);
+	//mipi_dsi_dcs_write_long_multi(&ctx, 0x60, 0x00);
 	/* 120 Hz */
-	//mipi_dsi_dcs_write_long_multi(&ctx, 0x60, 0x10);
+	mipi_dsi_dcs_write_long_multi(&ctx, 0x60, 0x10);
 
 	mipi_dsi_dcs_write_long_multi(&ctx, 0xf0, 0xa5, 0xa5);
 
@@ -223,7 +223,7 @@ static int samsung_amb655x_unprepare(struct drm_panel *panel)
 }
 
 static const struct drm_display_mode samsung_amb655x_120_mode = {
-	.clock = (1080 + 52 + 24 + 24) * (2400 + 4 + 4 + 8) * 60 / 1000,
+	.clock = (1080 + 52 + 24 + 24) * (2400 + 4 + 4 + 8) * 120 / 1000,
 	.hdisplay = 1080,
 	.hsync_start = 1080 + 52,
 	.hsync_end = 1080 + 52 + 24,
