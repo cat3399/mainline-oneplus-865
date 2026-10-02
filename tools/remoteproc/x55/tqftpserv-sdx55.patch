@@ -1,0 +1,136 @@
+diff --git a/tqftpserv.c b/tqftpserv.c
+index 5231243..bb8159c 100644
+--- a/tqftpserv.c
++++ b/tqftpserv.c
+@@ -132,6 +132,23 @@ static int sanitize_path(const char *path)
+ 	return 0;
+ }
+ 
++/* QRTR flow control can transiently reject a datagram. Never retry forever. */
++static ssize_t tftp_send_retry(int sock, const void *buf, size_t len)
++{
++	ssize_t ret;
++	unsigned int attempt;
++
++	for (attempt = 0; attempt < 100; attempt++) {
++		ret = send(sock, buf, len, MSG_DONTWAIT);
++		if (ret >= 0)
++			return ret;
++		if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
++			return ret;
++		usleep(10000);
++	}
++	return -1;
++}
++
+ static int tftp_send_error(int sock, enum tftp_error code, const char *msg)
+ {
+ 	size_t len;
+@@ -148,7 +165,7 @@ static int tftp_send_error(int sock, enum tftp_error code, const char *msg)
+ 	*(uint16_t *)(buf + 2) = htons(code);
+ 	memcpy(buf + 4, msg, len - 4);
+ 
+-	rc = send(sock, buf, len, 0);
++	rc = tftp_send_retry(sock, buf, len);
+ 	free(buf);
+ 	return rc;
+ }
+@@ -216,7 +233,7 @@ static ssize_t tftp_send_data(struct tftp_client *client,
+ 	}
+ 
+ 	log_debug("Sending %zd bytes of DATA to %d:%d\n", send_len, client->sq.sq_node, client->sq.sq_port);
+-	return send(client->sock, buf, send_len, 0);
++	return tftp_send_retry(client->sock, buf, send_len);
+ }
+ 
+ 
+@@ -227,7 +244,7 @@ static int tftp_send_ack(int sock, int block)
+ 		uint16_t block;
+ 	} ack = { htons(OP_ACK), htons(block) };
+ 
+-	return send(sock, &ack, sizeof(ack), 0);
++	return tftp_send_retry(sock, &ack, sizeof(ack));
+ }
+ 
+ static int tftp_send_oack(int sock, size_t *blocksize, size_t *tsize,
+@@ -320,7 +337,7 @@ static int tftp_send_oack(int sock, size_t *blocksize, size_t *tsize,
+ 		*p++ = '\0';
+ 	}
+ 
+-	return send(sock, buf, p - buf, 0);
++	return tftp_send_retry(sock, buf, p - buf);
+ }
+ 
+ static int parse_options(const char *buf, size_t len, size_t *blksize,
+@@ -946,7 +963,9 @@ int main(int argc, char **argv)
+ 		exit(1);
+ 	}
+ 
+-	ret = qrtr_publish(fd, 4096, 1, 0);
++	/* SDX55 requests service 4096 with the packed QRTR instance value 3.
++	 * libqrtr packs this as version | (instance << 8). */
++	ret = qrtr_publish(fd, 4096, 3, 0);
+ 	if (ret < 0) {
+ 		fprintf(stderr, "failed to publish service registry service\n");
+ 		exit(1);
+diff --git a/translate.c b/translate.c
+index 409ff95..177c35c 100644
+--- a/translate.c
++++ b/translate.c
+@@ -28,7 +28,7 @@
+ 
+ #ifndef ANDROID
+ #define FIRMWARE_BASE	"/lib/firmware/"
+-#define TQFTPSERV_RW_DIR	"/var/lib/tqftpserv"
++#define TQFTPSERV_RW_DIR	"/var/lib/x55-tqftpserv"
+ #else
+ #define FIRMWARE_BASE	"/vendor/firmware/"
+ #define TQFTPSERV_RW_DIR	"/data/vendor/tmp/tqftpserv"
+@@ -39,15 +39,16 @@ static int open_maybe_compressed(const char *path);
+ static void read_fw_path_from_sysfs(char *outbuffer, size_t bufsize)
+ {
+ 	size_t pathsize;
++	outbuffer[0] = '\0';
+ 	FILE *f = fopen("/sys/module/firmware_class/parameters/path", "rt");
+ 	if (!f)
+ 		return;
+-	pathsize = fread(outbuffer, sizeof(char), bufsize, f);
++	pathsize = fread(outbuffer, sizeof(char), bufsize - 1, f);
+ 	fclose(f);
+ 	if (pathsize == 0)
+ 		return;
+-	/* truncate newline */
+-	outbuffer[pathsize - 1] = '\0';
++	outbuffer[pathsize] = '\0';
++	outbuffer[strcspn(outbuffer, "\n")] = '\0';
+ }
+ 
+ /**
+@@ -107,14 +108,17 @@ static int translate_readonly(const char *file)
+ 		if (firmware_fd < 0)
+ 			continue;
+ 
+-		n = read(firmware_fd, firmware_value, sizeof(firmware_value));
++		n = read(firmware_fd, firmware_value, sizeof(firmware_value) - 1);
+ 		close(firmware_fd);
+ 		if (n < 0) {
+ 			continue;
+ 		}
+ 		firmware_value[n] = '\0';
+ 
++		free(firmware_value_copy);
+ 		firmware_value_copy = strdup(firmware_value);
++		if (!firmware_value_copy)
++			break;
+ 		firmware_path = dirname(firmware_value_copy);
+ 
+ 		/* first try path from sysfs */
+@@ -180,7 +184,7 @@ static int translate_readwrite(const char *file, int flags)
+ 	int fd;
+ 
+ 	/* Reject directory traversal attempts */
+-	if (strstr(file, "..")) {
++	if (file[0] == '/' || strstr(file, "..")) {
+ 		warn("path traversal attempt rejected: %s", file);
+ 		errno = EACCES;
+ 		return -1;

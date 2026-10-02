@@ -1,0 +1,4 @@
+[Unit]
+Description=X55 manual runtime services (does not boot or enable the modem)
+Wants=x55-mdm-helper.service x55-tqftpserv.service x55-pd-mapper.service x55-efs-sync.service
+# No Install section: only modem.sh explicitly starts this target.

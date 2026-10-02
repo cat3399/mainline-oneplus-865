@@ -1,0 +1,22 @@
+[Unit]
+Description=X55 QRTR remote filesystem (packed instance 3)
+PartOf=x55-runtime.target
+Conflicts=tqftpserv.service
+After=local-fs.target
+ConditionPathExists=/lib/firmware/qcom/sdx55m/modem_pr
+
+[Service]
+Type=simple
+Environment=LD_LIBRARY_PATH=/opt/x55/lib
+ExecStart=/opt/x55/bin/tqftpserv
+Restart=no
+StateDirectory=x55-tqftpserv
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_QIPCRTR AF_UNIX
+# Only private RFS state is writable. Never expose raw NV block devices.

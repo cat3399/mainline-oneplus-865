@@ -1,0 +1,2 @@
+# These are maintained userspace patches, not generated kernel build output.
+!*.patch

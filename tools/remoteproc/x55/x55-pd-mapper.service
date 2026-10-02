@@ -1,0 +1,18 @@
+[Unit]
+Description=X55 userspace protection-domain mapper
+PartOf=x55-runtime.target
+Conflicts=pd-mapper.service
+After=local-fs.target
+ConditionPathExists=/lib/firmware/qcom/sdx55m/modemr.jsn
+
+[Service]
+Type=simple
+Environment=LD_LIBRARY_PATH=/opt/x55/lib
+ExecStart=/opt/x55/bin/pd-mapper
+Restart=no
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_QIPCRTR AF_UNIX

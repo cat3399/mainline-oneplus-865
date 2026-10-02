@@ -1,0 +1,17 @@
+[Unit]
+Description=X55 ESOC request engine (manual bring-up)
+PartOf=x55-runtime.target
+After=sys-kernel-debug.mount
+Wants=sys-kernel-debug.mount
+ConditionPathExists=/sys/kernel/debug/esoc_mdm_dbg_eng
+
+[Service]
+Type=simple
+ExecStart=/opt/x55/bin/modem.sh helper
+Restart=no
+TimeoutStopSec=5
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/sys/kernel/debug/esoc_mdm_dbg_eng
+# Deliberately no Install section: do not auto-start the modem at boot.

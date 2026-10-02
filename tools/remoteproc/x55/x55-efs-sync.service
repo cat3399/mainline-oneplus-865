@@ -1,0 +1,32 @@
+[Unit]
+Description=X55 EFS sync to bounded private regular-file snapshots
+PartOf=x55-runtime.target
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/x55/bin/efs_sync.py --wait-seconds 120
+Environment=PYTHONDONTWRITEBYTECODE=1
+Restart=no
+TimeoutStopSec=5
+StateDirectory=x55-efs
+StateDirectoryMode=0700
+RuntimeDirectory=x55-efs
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+DevicePolicy=closed
+DeviceAllow=char-wwan_port rw
+RestrictAddressFamilies=AF_UNIX
+MemoryMax=64M
+TasksMax=8
+# No raw block-device access; only EFS WWAN plus State/RuntimeDirectory writes.
+# No Install section. No automatic retries; preserve failures for inspection.
