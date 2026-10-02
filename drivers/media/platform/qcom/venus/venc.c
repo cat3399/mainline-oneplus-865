@@ -24,6 +24,11 @@
 
 #define NUM_B_FRAMES_MAX	4
 
+static unsigned int venc_work_route;
+module_param_named(work_route, venc_work_route, uint, 0644);
+MODULE_PARM_DESC(work_route,
+		 "IRIS2 encoder VPP work routes (0 keeps firmware default)");
+
 /*
  * Three resons to keep MPLANE formats (despite that the number of planes
  * currently is one):
@@ -168,6 +173,27 @@ static int venc_enum_fmt(struct file *file, void *fh, struct v4l2_fmtdesc *f)
 	return 0;
 }
 
+static u32 venc_input_size(struct venus_inst *inst, u32 pixfmt,
+			   u32 width, u32 height)
+{
+	u32 stride, y_scanlines, uv_scanlines;
+
+	/*
+	 * IRIS2's linear NV12 encoder input contract uses the downstream
+	 * 64-bit Venus layout: 512-byte strides, 512 Y scanlines and 256 UV
+	 * scanlines.  The generic Venus layout is only 128/32/16 aligned.
+	 */
+	if (IS_IRIS2(inst->core) && pixfmt == V4L2_PIX_FMT_NV12) {
+		stride = ALIGN(width, 512);
+		y_scanlines = ALIGN(height, 512);
+		uv_scanlines = ALIGN((height + 1) >> 1, 256);
+
+		return ALIGN(stride * (y_scanlines + uv_scanlines), SZ_4K);
+	}
+
+	return venus_helper_get_framesz(pixfmt, width, height);
+}
+
 static const struct venus_format *
 venc_try_fmt_common(struct venus_inst *inst, struct v4l2_format *f)
 {
@@ -208,15 +234,19 @@ venc_try_fmt_common(struct venus_inst *inst, struct v4l2_format *f)
 	pixmp->num_planes = fmt->num_planes;
 	pixmp->flags = 0;
 
-	sizeimage = venus_helper_get_framesz(pixmp->pixelformat,
-					     pixmp->width,
-					     pixmp->height);
+	sizeimage = venc_input_size(inst, pixmp->pixelformat,
+				  pixmp->width, pixmp->height);
 	pfmt[0].sizeimage = max(ALIGN(pfmt[0].sizeimage, SZ_4K), sizeimage);
 
-	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
-		pfmt[0].bytesperline = ALIGN(pixmp->width, 128);
-	else
+	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+		if (IS_IRIS2(inst->core) &&
+		    pixmp->pixelformat == V4L2_PIX_FMT_NV12)
+			pfmt[0].bytesperline = ALIGN(pixmp->width, 512);
+		else
+			pfmt[0].bytesperline = ALIGN(pixmp->width, 128);
+	} else {
 		pfmt[0].bytesperline = 0;
+	}
 
 	return fmt;
 }
@@ -663,6 +693,7 @@ static int venc_set_properties(struct venus_inst *inst)
 	struct venc_controls *ctr = &inst->controls.enc;
 	struct hfi_intra_period intra_period;
 	struct hfi_framerate frate;
+	struct hfi_operating_rate op_rate;
 	struct hfi_bitrate brate;
 	struct hfi_idr_period idrp;
 	struct hfi_quantization quant;
@@ -675,6 +706,14 @@ static int venc_set_properties(struct venus_inst *inst)
 	u32 profile, level;
 	int ret;
 
+	if (IS_IRIS2(inst->core) || IS_IRIS2_1(inst->core)) {
+		ptype = HFI_PROPERTY_PARAM_VENC_LOW_LATENCY_MODE;
+		en.enable = 0;
+		ret = hfi_session_set_property(inst, ptype, &en);
+		if (ret)
+			return ret;
+	}
+
 	ret = venus_helper_set_work_mode(inst);
 	if (ret)
 		return ret;
@@ -684,6 +723,18 @@ static int venc_set_properties(struct venus_inst *inst)
 	frate.framerate = inst->fps * (1 << 16);
 
 	ret = hfi_session_set_property(inst, ptype, &frate);
+	if (ret)
+		return ret;
+
+	ptype = HFI_PROPERTY_CONFIG_OPERATING_RATE;
+	op_rate.operating_rate = inst->fps * (1 << 16);
+	ret = hfi_session_set_property(inst, ptype, &op_rate);
+	if (ret)
+		return ret;
+
+	ptype = HFI_PROPERTY_CONFIG_REALTIME;
+	en.enable = 1;
+	ret = hfi_session_set_property(inst, ptype, &en);
 	if (ret)
 		return ret;
 
@@ -834,6 +885,19 @@ static int venc_set_properties(struct venus_inst *inst)
 	ret = hfi_session_set_property(inst, ptype, &rate_control);
 	if (ret)
 		return ret;
+
+	/*
+	 * IRIS2's timestamp-based rate controller drops alternate frames above
+	 * 60 fps even when the session and hardware are configured for HFR.
+	 * For HFR sessions derive the RC interval from CONFIG_FRAME_RATE instead.
+	 */
+	if (IS_IRIS2(inst->core) && inst->fps > 60) {
+		ptype = HFI_PROPERTY_PARAM_VENC_DISABLE_RC_TIMESTAMP;
+		en.enable = 1;
+		ret = hfi_session_set_property(inst, ptype, &en);
+		if (ret)
+			return ret;
+	}
 
 	if (rate_control == HFI_RATE_CONTROL_CQ && ctr->const_quality) {
 		struct hfi_heic_frame_quality quality = {};
@@ -1024,6 +1088,34 @@ static int venc_set_properties(struct venus_inst *inst)
 	return 0;
 }
 
+static int venc_set_work_route(struct venus_inst *inst)
+{
+	struct venc_controls *ctr = &inst->controls.enc;
+	const u32 ptype = HFI_PROPERTY_PARAM_WORK_ROUTE;
+	struct hfi_video_work_route wr;
+
+	if (!(IS_IRIS2(inst->core) || IS_IRIS2_1(inst->core)))
+		return 0;
+	if (!venc_work_route)
+		return 0;
+	if (venc_work_route > inst->core->res->num_vpp_pipes)
+		return -EINVAL;
+
+	wr.video_work_route = venc_work_route;
+
+	/*
+	 * IRIS2 can split H.264/HEVC encode work over all VPP pipes. VP8 and
+	 * byte-based multi-slice sessions retain the firmware's single-route
+	 * contract, matching the downstream msm-vidc policy.
+	 */
+	if (inst->fmt_cap->pixfmt == V4L2_PIX_FMT_VP8 ||
+	    ctr->multi_slice_mode ==
+		V4L2_MPEG_VIDEO_MULTI_SLICE_MODE_MAX_BYTES)
+		wr.video_work_route = 1;
+
+	return hfi_session_set_property(inst, ptype, &wr);
+}
+
 static int venc_init_session(struct venus_inst *inst)
 {
 	int ret;
@@ -1034,8 +1126,12 @@ static int venc_init_session(struct venus_inst *inst)
 	else if (ret)
 		return ret;
 
-	ret = venus_helper_set_stride(inst, inst->out_width,
-				      inst->out_height);
+	if (IS_IRIS2(inst->core) && inst->fmt_out->pixfmt == V4L2_PIX_FMT_NV12)
+		ret = venus_helper_set_stride(inst, ALIGN(inst->out_width, 512),
+					      ALIGN(inst->out_height, 512));
+	else
+		ret = venus_helper_set_stride(inst, inst->out_width,
+					      inst->out_height);
 	if (ret)
 		goto deinit;
 
@@ -1054,7 +1150,15 @@ static int venc_init_session(struct venus_inst *inst)
 	if (ret)
 		goto deinit;
 
+	ret = venus_helper_set_format_constraints(inst);
+	if (ret)
+		goto deinit;
+
 	ret = venc_set_properties(inst);
+	if (ret)
+		goto deinit;
+
+	ret = venc_set_work_route(inst);
 	if (ret)
 		goto deinit;
 
@@ -1144,9 +1248,9 @@ static int venc_queue_setup(struct vb2_queue *q,
 		*num_buffers = max(*num_buffers, num);
 		inst->num_input_bufs = *num_buffers;
 
-		sizes[0] = venus_helper_get_framesz(inst->fmt_out->pixfmt,
-						    inst->out_width,
-						    inst->out_height);
+		sizes[0] = venc_input_size(inst, inst->fmt_out->pixfmt,
+					   inst->out_width,
+					   inst->out_height);
 		inst->input_buf_size = sizes[0];
 		break;
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
@@ -1271,15 +1375,23 @@ static int venc_start_streaming(struct vb2_queue *q, unsigned int count)
 	if (ret)
 		goto error;
 
+	/*
+	 * Configure firmware routing before selecting and powering the codec
+	 * core, as required by the downstream IRIS2 start sequence.
+	 */
+	ret = venc_set_properties(inst);
+	if (ret)
+		goto put_power;
+
+	ret = venc_set_work_route(inst);
+	if (ret)
+		goto put_power;
+
 	ret = venus_pm_acquire_core(inst);
 	if (ret)
 		goto put_power;
 
 	ret = venc_pm_put(inst, true);
-	if (ret)
-		goto error;
-
-	ret = venc_set_properties(inst);
 	if (ret)
 		goto error;
 

@@ -766,7 +766,7 @@ static const struct id_mapping h264_levels[] = {
 	{ HFI_H264_LEVEL_42, V4L2_MPEG_VIDEO_H264_LEVEL_4_2 },
 	{ HFI_H264_LEVEL_5, V4L2_MPEG_VIDEO_H264_LEVEL_5_0 },
 	{ HFI_H264_LEVEL_51, V4L2_MPEG_VIDEO_H264_LEVEL_5_1 },
-	{ HFI_H264_LEVEL_52, V4L2_MPEG_VIDEO_H264_LEVEL_5_1 },
+	{ HFI_H264_LEVEL_52, V4L2_MPEG_VIDEO_H264_LEVEL_5_2 },
 };
 
 static const struct id_mapping hevc_profiles[] = {
@@ -1194,21 +1194,45 @@ int venus_helper_set_format_constraints(struct venus_inst *inst)
 	if (!IS_V6(inst->core))
 		return 0;
 
-	if (inst->opb_fmt == HFI_COLOR_FORMAT_NV12_UBWC ||
-	    inst->opb_fmt == HFI_COLOR_FORMAT_YUV420_TP10_UBWC)
-		return 0;
+	if (inst->session_type == VIDC_SESSION_TYPE_ENC) {
+		if (inst->fmt_out->pixfmt != V4L2_PIX_FMT_NV12)
+			return 0;
 
-	pconstraint.buffer_type = HFI_BUFFER_OUTPUT2;
-	pconstraint.num_planes = 2;
-	pconstraint.plane_format[0].stride_multiples = 128;
-	pconstraint.plane_format[0].max_stride = 8192;
-	pconstraint.plane_format[0].min_plane_buffer_height_multiple = 32;
-	pconstraint.plane_format[0].buffer_alignment = 256;
+		pconstraint.buffer_type = HFI_BUFFER_INPUT;
+		pconstraint.num_planes = 2;
+		pconstraint.plane_format[0].max_stride = 16384;
+		pconstraint.plane_format[0].buffer_alignment = 512;
+		pconstraint.plane_format[1].max_stride = 16384;
+		pconstraint.plane_format[1].buffer_alignment = 256;
 
-	pconstraint.plane_format[1].stride_multiples = 128;
-	pconstraint.plane_format[1].max_stride = 8192;
-	pconstraint.plane_format[1].min_plane_buffer_height_multiple = 16;
-	pconstraint.plane_format[1].buffer_alignment = 256;
+		if (IS_IRIS2(inst->core)) {
+			pconstraint.plane_format[0].stride_multiples = 512;
+			pconstraint.plane_format[0].min_plane_buffer_height_multiple = 512;
+			pconstraint.plane_format[1].stride_multiples = 512;
+			pconstraint.plane_format[1].min_plane_buffer_height_multiple = 256;
+		} else {
+			pconstraint.plane_format[0].stride_multiples = 128;
+			pconstraint.plane_format[0].min_plane_buffer_height_multiple = 32;
+			pconstraint.plane_format[1].stride_multiples = 128;
+			pconstraint.plane_format[1].min_plane_buffer_height_multiple = 16;
+		}
+	} else {
+		if (inst->opb_fmt == HFI_COLOR_FORMAT_NV12_UBWC ||
+		    inst->opb_fmt == HFI_COLOR_FORMAT_YUV420_TP10_UBWC)
+			return 0;
+
+		pconstraint.buffer_type = HFI_BUFFER_OUTPUT2;
+		pconstraint.num_planes = 2;
+		pconstraint.plane_format[0].stride_multiples = 128;
+		pconstraint.plane_format[0].max_stride = 8192;
+		pconstraint.plane_format[0].min_plane_buffer_height_multiple = 32;
+		pconstraint.plane_format[0].buffer_alignment = 256;
+
+		pconstraint.plane_format[1].stride_multiples = 128;
+		pconstraint.plane_format[1].max_stride = 8192;
+		pconstraint.plane_format[1].min_plane_buffer_height_multiple = 16;
+		pconstraint.plane_format[1].buffer_alignment = 256;
+	}
 
 	return hfi_session_set_property(inst, ptype, &pconstraint);
 }

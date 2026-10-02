@@ -575,10 +575,24 @@ static int move_core_to_power_save_mode(struct venus_core *core,
 	return 0;
 }
 
+static u32 load_per_work_route(struct venus_inst *inst,
+			       unsigned long vpp_freq)
+{
+	u32 work_routes = max_t(u32, inst->core->res->num_vpp_pipes, 1);
+	u64 load = (u64)load_per_instance(inst) * vpp_freq;
+
+	/*
+	 * IRIS2 distributes macroblocks over multiple VPP pipes.  Comparing the
+	 * aggregate load against one pipe's clock rejects valid operating points,
+	 * including SM8250's advertised 3840x2160@60 encode mode.
+	 */
+	return DIV_ROUND_UP_ULL(load, work_routes);
+}
+
 static void
 min_loaded_core(struct venus_inst *inst, u32 *min_coreid, u32 *min_load, bool low_power)
 {
-	u32 mbs_per_sec, load, core1_load = 0, core2_load = 0;
+	u32 load, core1_load = 0, core2_load = 0;
 	u32 cores_max = core_num_max(inst);
 	struct venus_core *core = inst->core;
 	struct venus_inst *inst_pos;
@@ -604,8 +618,7 @@ min_loaded_core(struct venus_inst *inst, u32 *min_coreid, u32 *min_load, bool lo
 
 		coreid = inst_pos->clk_data.core_id;
 
-		mbs_per_sec = load_per_instance(inst_pos);
-		load = mbs_per_sec * vpp_freq;
+		load = load_per_work_route(inst_pos, vpp_freq);
 
 		if ((coreid & VIDC_CORE_ID_3) == VIDC_CORE_ID_3) {
 			core1_load += load / 2;
@@ -637,6 +650,8 @@ static int decide_core(struct venus_inst *inst)
 	u32 min_lp_coreid, min_lp_load, cur_inst_lp_load;
 	struct hfi_videocores_usage_type cu;
 	unsigned long max_freq;
+	u32 mbpf;
+	bool power_save;
 	int ret = 0;
 
 	if (legacy_binding) {
@@ -651,13 +666,34 @@ static int decide_core(struct venus_inst *inst)
 	if (inst->clk_data.core_id != VIDC_CORE_ID_DEFAULT)
 		return 0;
 
-	cur_inst_load = load_per_instance(inst);
-	cur_inst_load *= inst->clk_data.vpp_freq;
-	/*TODO : divide this inst->load by work_route */
+	/*
+	 * IRIS2 uses its power-save encoder pipeline above the high-quality
+	 * limit.  Despite the name, this is the multi-pipe high-throughput
+	 * path selected by downstream Kona for anything above 1080p60.
+	 */
+	if (IS_IRIS2(core) &&
+	    inst->session_type == VIDC_SESSION_TYPE_ENC &&
+	    core->res->max_hq_mbs_per_frame &&
+	    core->res->max_hq_mbs_per_sec) {
+		mbpf = (ALIGN(inst->width, 16) / 16) *
+		       (ALIGN(inst->height, 16) / 16);
+		power_save = mbpf > core->res->max_hq_mbs_per_frame ||
+			     load_per_instance(inst) >
+				core->res->max_hq_mbs_per_sec;
 
-	cur_inst_lp_load = load_per_instance(inst);
-	cur_inst_lp_load *= inst->clk_data.low_power_freq;
-	/*TODO : divide this inst->load by work_route */
+		ret = power_save_mode_enable(inst, power_save);
+		if (ret)
+			return ret;
+
+		inst->clk_data.core_id = VIDC_CORE_ID_1;
+		cu.video_core_enable_mask = VIDC_CORE_ID_1;
+		goto done;
+	}
+
+	cur_inst_load = load_per_work_route(inst, inst->clk_data.vpp_freq);
+
+	cur_inst_lp_load = load_per_work_route(inst,
+					       inst->clk_data.low_power_freq);
 
 	max_freq = core->res->freq_tbl[0].freq;
 

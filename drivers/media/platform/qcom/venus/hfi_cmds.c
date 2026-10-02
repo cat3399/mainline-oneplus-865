@@ -433,6 +433,13 @@ static int pkt_session_set_property_1x(struct hfi_session_set_property_pkt *pkt,
 		pkt->shdr.hdr.size += sizeof(u32) + sizeof(*frate);
 		break;
 	}
+	case HFI_PROPERTY_CONFIG_OPERATING_RATE: {
+		struct hfi_operating_rate *in = pdata, *rate = prop_data;
+
+		rate->operating_rate = in->operating_rate;
+		pkt->shdr.hdr.size += sizeof(u32) + sizeof(*rate);
+		break;
+	}
 	case HFI_PROPERTY_PARAM_UNCOMPRESSED_FORMAT_SELECT: {
 		struct hfi_uncompressed_format_select *in = pdata;
 		struct hfi_uncompressed_format_select *hfi = prop_data;
@@ -899,6 +906,7 @@ static int pkt_session_set_property_1x(struct hfi_session_set_property_pkt *pkt,
 		pkt->shdr.hdr.size += sizeof(u32) + sizeof(*en);
 		break;
 	}
+	case HFI_PROPERTY_PARAM_VENC_LOW_LATENCY_MODE:
 	case HFI_PROPERTY_PARAM_VENC_PRESERVE_TEXT_QUALITY: {
 		struct hfi_enable *in = pdata, *en = prop_data;
 
