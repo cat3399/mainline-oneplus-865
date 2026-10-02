@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+/*
+ * Experimental OnePlus 8T X55 bring-up, kept separate from the normal DTB.
+ * Wiring: OnePlus project 19805 kona{,-mhi,-pmic-overlay}.dtsi.
+ * ESOC binding/boot path: royka1/apollo-linux, apollo-6.17.
+ */
+#include "sm8250-oneplus-kebab.dts"
+#include <dt-bindings/interconnect/qcom,sm8250.h>
+
+&soc {
+	mdm0: modem {
+		compatible = "qcom,ext-sdx55m";
+		cell-index = <0>;
+		#address-cells = <0>;
+		interrupt-parent = <&mdm0>;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0xffffffff>;
+		interrupt-names = "err_fatal_irq", "status_irq",
+				  "mdm2ap_vddmin_irq";
+		interrupt-map = <0 &tlmm 1 IRQ_TYPE_EDGE_BOTH>,
+				<1 &tlmm 3 IRQ_TYPE_EDGE_BOTH>;
+		qcom,ramdump-delay-ms = <3000>;
+		qcom,ramdump-timeout-ms = <120000>;
+		qcom,vddmin-modes = "normal";
+		qcom,vddmin-drive-strength = <8>;
+		qcom,sfr-query;
+		qcom,sysmon-id = <20>;
+		qcom,ssctl-instance-id = <0x10>;
+		qcom,support-shutdown;
+		qcom,pil-force-shutdown;
+		qcom,esoc-skip-restart-for-mdm-crash;
+		qcom,ignore-ssr-failure;
+		pinctrl-names = "mdm_active", "mdm_suspend";
+		pinctrl-0 = <&ap2mdm_active &mdm2ap_active>;
+		pinctrl-1 = <&ap2mdm_sleep &mdm2ap_sleep>;
+		qcom,mdm2ap-errfatal-gpio = <&tlmm 1 GPIO_ACTIVE_HIGH>;
+		qcom,ap2mdm-errfatal-gpio = <&tlmm 57 GPIO_ACTIVE_HIGH>;
+		qcom,mdm2ap-status-gpio = <&tlmm 3 GPIO_ACTIVE_HIGH>;
+		qcom,ap2mdm-status-gpio = <&tlmm 56 GPIO_ACTIVE_HIGH>;
+		qcom,mdm-link-info = "0306_02.01.00";
+		/* No qcom,mdm-auto-boot: userspace starts esoc explicitly. */
+		status = "okay";
+	};
+};
+
+&pcie2 {
+	interconnects = <&aggre1_noc MASTER_PCIE_2 0 &mc_virt SLAVE_EBI_CH0 0>,
+		       <&gem_noc MASTER_AMPSS_M0 0 &config_noc SLAVE_PCIE_2_CFG 0>;
+	interconnect-names = "pcie-mem", "cpu-pcie";
+
+	pcie@0 {
+		modem@0 {
+			reg = <0x10000 0 0 0 0>;
+			esoc-names = "mdm";
+			esoc-0 = <&mdm0>;
+			mhi,timeout = <60000>;
+			mhi,buffer-len = <0x8000>;
+			qcom,iommu-group = <&x55_iommu_group>;
+
+			x55_iommu_group: iommu-group {
+				qcom,iommu-dma-addr-pool = <0x20000000 0x1fffffff>;
+				qcom,iommu-dma = "fastmap";
+				qcom,iommu-pagetable = "coherent";
+			};
+		};
+	};
+};
+
+&spmi_bus {
+	pmic@8 {
+		compatible = "qcom,spmi-pmic";
+		reg = <0x8 SPMI_USID>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		pon@800 {
+			compatible = "qcom,qpnp-power-on";
+			reg = <0x800 0x100>;
+			qcom,modem-reset;
+		};
+	};
+};
+
+&tlmm {
+	ap2mdm_active: ap2mdm-active-state {
+		pins = "gpio56", "gpio57";
+		function = "gpio";
+		drive-strength = <16>;
+		bias-disable;
+	};
+
+	ap2mdm_sleep: ap2mdm-sleep-state {
+		pins = "gpio56", "gpio57";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-disable;
+	};
+
+	mdm2ap_active: mdm2ap-active-state {
+		pins = "gpio1", "gpio3";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-disable;
+	};
+
+	mdm2ap_sleep: mdm2ap-sleep-state {
+		pins = "gpio1", "gpio3";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-disable;
+	};
+};
