@@ -72,6 +72,11 @@ struct sysmon_event {
 static DEFINE_MUTEX(sysmon_lock);
 static LIST_HEAD(sysmon_list);
 
+static bool sysmon_suppress_powerup_events(const struct qcom_sysmon *sysmon)
+{
+	return false;
+}
+
 /**
  * sysmon_send_event() - send notification of other remote's SSR event
  * @sysmon:	sysmon context
@@ -422,6 +427,11 @@ static int ssctl_new_server(struct qmi_handle *qmi, struct qmi_service *svc)
 {
 	struct qcom_sysmon *sysmon = container_of(qmi, struct qcom_sysmon, qmi);
 
+	dev_info(sysmon->dev,
+		 "sysmon[%s]: ssctl new_server v=%u inst=0x%x node=%u port=%u (want_inst=0x%x)\n",
+		 sysmon->name, svc->version, svc->instance, svc->node, svc->port,
+		 sysmon->ssctl_instance);
+
 	switch (svc->version) {
 	case 1:
 		if (svc->instance != 0)
@@ -438,6 +448,9 @@ static int ssctl_new_server(struct qmi_handle *qmi, struct qmi_service *svc)
 	}
 
 	sysmon->ssctl_version = svc->version;
+	dev_info(sysmon->dev,
+		 "sysmon[%s]: ssctl MATCHED v=%u inst=0x%x at %u:%u\n",
+		 sysmon->name, svc->version, svc->instance, svc->node, svc->port);
 
 	sysmon->ssctl.sq_family = AF_QIPCRTR;
 	sysmon->ssctl.sq_node = svc->node;
@@ -476,6 +489,9 @@ static int sysmon_prepare(struct rproc_subdev *subdev)
 		.ssr_event = SSCTL_SSR_EVENT_BEFORE_POWERUP
 	};
 
+	if (sysmon_suppress_powerup_events(sysmon))
+		return 0;
+
 	mutex_lock(&sysmon->state_lock);
 	sysmon->state = SSCTL_SSR_EVENT_BEFORE_POWERUP;
 	blocking_notifier_call_chain(&sysmon_notifiers, 0, (void *)&event);
@@ -506,11 +522,31 @@ static int sysmon_start(struct rproc_subdev *subdev)
 	reinit_completion(&sysmon->ssctl_comp);
 	mutex_lock(&sysmon->state_lock);
 	sysmon->state = SSCTL_SSR_EVENT_AFTER_POWERUP;
-	blocking_notifier_call_chain(&sysmon_notifiers, 0, (void *)&event);
+	if (!sysmon_suppress_powerup_events(sysmon))
+		blocking_notifier_call_chain(&sysmon_notifiers, 0,
+					     (void *)&event);
 	mutex_unlock(&sysmon->state_lock);
+
+	if (!strcmp(sysmon->name, "SDX55M") &&
+	    sysmon->ssctl_instance && !sysmon->ssctl_version) {
+		dev_info(sysmon->dev,
+			 "sysmon[%s]: waiting for ssctl service to publish\n",
+			 sysmon->name);
+		if (!wait_for_completion_timeout(&sysmon->ssctl_comp, 5 * HZ))
+			dev_warn(sysmon->dev,
+				 "sysmon[%s]: timeout waiting for ssctl service\n",
+				 sysmon->name);
+		else
+			dev_info(sysmon->dev,
+				 "sysmon[%s]: ssctl service ready (v=%d)\n",
+				 sysmon->name, sysmon->ssctl_version);
+	}
 
 	mutex_lock(&sysmon_lock);
 	list_for_each_entry(target, &sysmon_list, node) {
+		if (sysmon_suppress_powerup_events(sysmon))
+			break;
+
 		mutex_lock(&target->state_lock);
 		if (target == sysmon || target->state != SSCTL_SSR_EVENT_AFTER_POWERUP) {
 			mutex_unlock(&target->state_lock);
@@ -520,10 +556,14 @@ static int sysmon_start(struct rproc_subdev *subdev)
 		event.subsys_name = target->name;
 		event.ssr_event = target->state;
 
-		if (sysmon->ssctl_version == 2)
+		if (sysmon->ssctl_version == 2) {
+			dev_info(sysmon->dev,
+				 "sysmon[%s]: notifying peer %s state=%d via ssctl\n",
+				 sysmon->name, target->name, target->state);
 			ssctl_send_event(sysmon, &event);
-		else if (sysmon->ept)
+		} else if (sysmon->ept) {
 			sysmon_send_event(sysmon, &event);
+		}
 		mutex_unlock(&target->state_lock);
 	}
 	mutex_unlock(&sysmon_lock);
@@ -613,6 +653,147 @@ static irqreturn_t sysmon_shutdown_interrupt(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+#define QMI_SSCTL_GET_FAILURE_REASON_REQ	0x0022
+#define QMI_SSCTL_EMPTY_MSG_LENGTH		0
+#define QMI_SSCTL_ERROR_MSG_LENGTH		90
+#define QMI_EOTI_DATA_TYPE	\
+{				\
+	.data_type = QMI_EOTI,	\
+	.elem_len  = 0,		\
+	.elem_size = 0,		\
+	.array_type  = NO_ARRAY,\
+	.tlv_type  = 0x00,	\
+	.offset    = 0,		\
+	.ei_array  = NULL,	\
+},
+
+struct qmi_ssctl_get_failure_reason_resp_msg {
+	struct qmi_response_type_v01 resp;
+	uint8_t error_message_valid;
+	uint32_t error_message_len;
+	char error_message[QMI_SSCTL_ERROR_MSG_LENGTH];
+};
+
+static struct qmi_elem_info qmi_ssctl_get_failure_reason_req_msg_ei[] = {
+	QMI_EOTI_DATA_TYPE
+};
+
+static struct qmi_elem_info qmi_ssctl_get_failure_reason_resp_msg_ei[] = {
+	{
+		.data_type = QMI_STRUCT,
+		.elem_len  = 1,
+		.elem_size = sizeof(struct qmi_response_type_v01),
+		.array_type  = NO_ARRAY,
+		.tlv_type  = 0x02,
+		.offset    = offsetof(
+			struct qmi_ssctl_get_failure_reason_resp_msg,
+							resp),
+		.ei_array  = qmi_response_type_v01_ei,
+	},
+	{
+		.data_type = QMI_OPT_FLAG,
+		.elem_len  = 1,
+		.elem_size = sizeof(uint8_t),
+		.array_type  = NO_ARRAY,
+		.tlv_type  = 0x10,
+		.offset    = offsetof(
+			struct qmi_ssctl_get_failure_reason_resp_msg,
+						error_message_valid),
+		.ei_array  = NULL,
+	},
+	{
+		.data_type = QMI_DATA_LEN,
+		.elem_len  = 1,
+		.elem_size = sizeof(uint8_t),
+		.array_type  = NO_ARRAY,
+		.tlv_type  = 0x10,
+		.offset    = offsetof(
+			struct qmi_ssctl_get_failure_reason_resp_msg,
+						error_message_len),
+		.ei_array  = NULL,
+	},
+	{
+		.data_type = QMI_UNSIGNED_1_BYTE,
+		.elem_len  = QMI_SSCTL_ERROR_MSG_LENGTH,
+		.elem_size = sizeof(char),
+		.array_type  = VAR_LEN_ARRAY,
+		.tlv_type  = 0x10,
+		.offset    = offsetof(
+			struct qmi_ssctl_get_failure_reason_resp_msg,
+						error_message),
+		.ei_array  = NULL,
+	},
+	QMI_EOTI_DATA_TYPE
+};
+
+/**
+ * qcom_sysmon_get_reason() - Retrieve failure reason from a subsystem.
+ * @dest_desc:	Subsystem descriptor of the subsystem to query
+ * @buf:	Caller-allocated buffer for the returned NUL-terminated reason
+ * @len:	Length of @buf
+ *
+ * Reverts to using legacy sysmon API (sysmon_get_reason_no_qmi()) if client
+ * handle is not set.
+ *
+ * Returns 0 for success, -EINVAL for an invalid destination, -ENODEV if
+ * the SMD transport channel is not open, -ETIMEDOUT if the destination
+ * subsystem does not respond, and -EPROTO if the destination subsystem
+ * responds with something unexpected.
+ *
+ */
+int qcom_sysmon_get_reason(struct qcom_sysmon *sysmon, char *buf, size_t len)
+{
+	char req = 0;
+	struct qmi_ssctl_get_failure_reason_resp_msg resp = {};
+	struct qmi_txn txn;
+	const char *dest_ss;
+	int ret;
+
+	if (sysmon == NULL || buf == NULL || len == 0)
+		return -EINVAL;
+
+	dest_ss = sysmon->name;
+
+	ret = qmi_txn_init(&sysmon->qmi, &txn, qmi_ssctl_get_failure_reason_resp_msg_ei,
+			   &resp);
+	if (ret < 0) {
+		pr_err("SYSMON QMI tx init failed to dest %s, ret - %d\n", dest_ss, ret);
+		goto out;
+	}
+
+	ret = qmi_send_request(&sysmon->qmi, &sysmon->ssctl, &txn,
+			       QMI_SSCTL_GET_FAILURE_REASON_REQ,
+			       QMI_SSCTL_EMPTY_MSG_LENGTH,
+			       qmi_ssctl_get_failure_reason_req_msg_ei,
+			       &req);
+	if (ret < 0) {
+		pr_err("SYSMON QMI send req failed to dest %s, ret - %d\n", dest_ss, ret);
+		qmi_txn_cancel(&txn);
+		goto out;
+	}
+
+	ret = qmi_txn_wait(&txn, 5 * HZ);
+	if (ret < 0) {
+		pr_err("SYSMON QMI qmi txn wait failed to dest %s, ret - %d\n", dest_ss, ret);
+		goto out;
+	} else if (resp.resp.result) {
+		dev_err(sysmon->dev, "failed to receive req. response result: %d\n",
+			resp.resp.result);
+		ret = -EREMOTEIO;
+		goto out;
+	}
+	if (!resp.error_message_valid) {
+		ret = -ENODATA;
+		goto out;
+	}
+	resp.error_message[min_t(size_t, resp.error_message_len,
+				 sizeof(resp.error_message) - 1)] = '\0';
+	strscpy(buf, resp.error_message, len);
+out:
+	return ret;
+}
+EXPORT_SYMBOL(qcom_sysmon_get_reason);
+
 /**
  * qcom_add_sysmon_subdev() - create a sysmon subdev for the given remoteproc
  * @rproc:	rproc context to associate the subdev with
@@ -678,6 +859,9 @@ struct qcom_sysmon *qcom_add_sysmon_subdev(struct rproc *rproc,
 	}
 
 	qmi_add_lookup(&sysmon->qmi, 43, 0, 0);
+	dev_info(sysmon->dev,
+		 "sysmon[%s]: registered, ssctl_instance=0x%x, lookup(43,0,0) sent\n",
+		 sysmon->name, ssctl_instance);
 
 	sysmon->subdev.prepare = sysmon_prepare;
 	sysmon->subdev.start = sysmon_start;

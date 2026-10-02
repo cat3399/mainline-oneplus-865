@@ -42,6 +42,7 @@
 #define PMI632_SUBTYPE		0x25
 #define PM8150C_SUBTYPE		0x26
 #define PM6150_SUBTYPE		0x28
+#define PM6150L_SUBTYPE		PM8150L_SUBTYPE
 #define SMB2351_SUBTYPE		0x29
 #define PM8008_SUBTYPE		0x2c
 #define PM6125_SUBTYPE		0x2d
@@ -57,6 +58,12 @@
 #define PM660_FAB_ID_GF		0x0
 #define PM660_FAB_ID_TSMC	0x2
 #define PM660_FAB_ID_MX		0x3
+
+#define PM660L_V1P1_REV1	0x00
+#define PM660L_V1P1_REV2	0x00
+#define PM660L_V1P1_REV3	0x01
+#define PM660L_V1P1_REV4	0x01
+#define PM660L_V2P0_REV4	0x02
 
 struct qcom_spmi_pmic {
 	unsigned int type;

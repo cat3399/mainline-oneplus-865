@@ -17,22 +17,62 @@
 
 struct device_node;
 
+/*
+ * This is Linux-specific flags. By default controllers' and Linux' mapping
+ * match, but GPIO controllers are free to translate their own flags to
+ * Linux-specific in their .xlate callback. Though, 1:1 mapping is recommended.
+ */
+enum of_gpio_flags {
+	OF_GPIO_ACTIVE_LOW = 0x1,
+	OF_GPIO_SINGLE_ENDED = 0x2,
+	OF_GPIO_OPEN_DRAIN = 0x4,
+	OF_GPIO_TRANSITORY = 0x8,
+	OF_GPIO_PULL_UP = 0x10,
+	OF_GPIO_PULL_DOWN = 0x20,
+	OF_GPIO_PULL_DISABLE = 0x40,
+};
+
 #ifdef CONFIG_OF_GPIO
 
 extern int of_get_named_gpio(const struct device_node *np,
 			     const char *list_name, int index);
+
+extern int of_get_named_gpio_flags(const struct device_node *np,
+		const char *list_name, int index, enum of_gpio_flags *flags);
 
 #else /* CONFIG_OF_GPIO */
 
 #include <linux/errno.h>
 
 /* Drivers may not strictly depend on the GPIO support, so let them link. */
-static inline int of_get_named_gpio(const struct device_node *np,
-                                   const char *propname, int index)
+static inline int of_get_named_gpio_flags(const struct device_node *np,
+		const char *list_name, int index, enum of_gpio_flags *flags)
 {
+	if (flags)
+		*flags = 0;
+
 	return -ENOSYS;
 }
 
 #endif /* CONFIG_OF_GPIO */
+
+static inline int of_get_gpio_flags(const struct device_node *np, int index,
+		      enum of_gpio_flags *flags)
+{
+	return of_get_named_gpio_flags(np, "gpios", index, flags);
+}
+
+/**
+ * of_get_gpio() - Get a GPIO number to use with GPIO API
+ * @np:		device node to get GPIO from
+ * @index:	index of the GPIO
+ *
+ * Returns GPIO number to use with Linux generic GPIO API, or one of the errno
+ * value on the error condition.
+ */
+static inline int of_get_gpio(const struct device_node *np, int index)
+{
+	return of_get_gpio_flags(np, index, NULL);
+}
 
 #endif /* __LINUX_OF_GPIO_H */
