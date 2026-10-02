@@ -325,6 +325,18 @@ config INPUT_GPIO_DECODER
 	 To compile this driver as a module, choose M here: the module
 	 will be called gpio_decoder.
 
+config INPUT_DUAL_HALL_SLIDER
+	tristate "Three-position selector using two IIO Hall sensors"
+	depends on IIO
+	help
+	  Report mechanical positions from two magnetic IIO channels as
+	  an absolute input axis. No audio, notification or key policy is
+	  assigned to the positions. Sampling runs only while the input
+	  device is open.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called dual-hall-slider.
+
 config INPUT_GPIO_VIBRA
 	tristate "GPIO vibrator support"
 	depends on GPIOLIB || COMPILE_TEST

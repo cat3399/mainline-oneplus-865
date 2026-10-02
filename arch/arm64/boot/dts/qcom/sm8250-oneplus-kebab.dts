@@ -10,6 +10,34 @@
 	model = "OnePlus 8T";
 	compatible = "oneplus,kebab", "qcom,sm8250";
 
+	/* Alternative stock BOMs: each input depends only on its own Hall pair. */
+	hall-slider {
+		compatible = "dual-hall-slider";
+		io-channels = <&slider_hall_end0>, <&slider_hall_end2>;
+		io-channel-names = "end-0", "end-2";
+		pinctrl-names = "default";
+		pinctrl-0 = <&slider_hall_end0_default>, <&slider_hall_end2_default>;
+		linux,axis = <ABS_MISC>;
+		position-threshold = <30>;
+		hysteresis = <8>;
+		interference-threshold = <40>;
+		debounce-interval = <100>;
+		poll-interval = <100>;
+	};
+
+	hall-slider-mxm1120 {
+		compatible = "dual-hall-slider";
+		io-channels = <&slider_hall_mxm_end0>, <&slider_hall_mxm_end2>;
+		io-channel-names = "end-0", "end-2";
+		pinctrl-names = "default";
+		pinctrl-0 = <&slider_hall_end0_default>, <&slider_hall_end2_default>;
+		linux,axis = <ABS_MISC>;
+		position-threshold = <30>;
+		hysteresis = <8>;
+		interference-threshold = <40>;
+		debounce-interval = <100>;
+		poll-interval = <100>;
+	};
 };
 
 &display_panel {
@@ -20,6 +48,48 @@
 /* Keep external DP out of the display pipeline for the internal-panel test. */
 &mdss_dp {
 	status = "disabled";
+};
+
+&i2c1 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	/* Both BOMs are firmware-described; each sensor verifies its own chip ID. */
+	slider_hall_mxm_end2: magnetometer@c {
+		compatible = "magnachip,mxm1120";
+		reg = <0x0c>;
+		#io-channel-cells = <0>;
+		label = "slider-mxm-end-2";
+		vdd-supply = <&vreg_l10c_3p0>;
+		interrupts-extended = <&tlmm 138 IRQ_TYPE_LEVEL_LOW>;
+	};
+
+	slider_hall_mxm_end0: magnetometer@d {
+		compatible = "magnachip,mxm1120";
+		reg = <0x0d>;
+		#io-channel-cells = <0>;
+		label = "slider-mxm-end-0";
+		vdd-supply = <&vreg_l10c_3p0>;
+		interrupts-extended = <&tlmm 157 IRQ_TYPE_LEVEL_LOW>;
+	};
+
+	slider_hall_end2: magnetometer@18 {
+		compatible = "isentek,ist8801";
+		reg = <0x18>;
+		#io-channel-cells = <0>;
+		label = "slider-end-2";
+		vdd-supply = <&vreg_l10c_3p0>;
+		interrupts-extended = <&tlmm 138 IRQ_TYPE_LEVEL_LOW>;
+	};
+
+	slider_hall_end0: magnetometer@19 {
+		compatible = "isentek,ist8801";
+		reg = <0x19>;
+		#io-channel-cells = <0>;
+		label = "slider-end-0";
+		vdd-supply = <&vreg_l10c_3p0>;
+		interrupts-extended = <&tlmm 157 IRQ_TYPE_LEVEL_LOW>;
+	};
 };
 
 &i2c13 {
@@ -39,6 +109,24 @@
 
 		vdd-supply = <&vreg_l13a_ts_3p0>;
 		vcc-supply = <&vreg_l1c_1p8>;
+	};
+};
+
+&tlmm {
+	slider_hall_end0_default: slider-hall-end0-default-state {
+		pins = "gpio157";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+		input-enable;
+	};
+
+	slider_hall_end2_default: slider-hall-end2-default-state {
+		pins = "gpio138";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+		input-enable;
 	};
 };
 

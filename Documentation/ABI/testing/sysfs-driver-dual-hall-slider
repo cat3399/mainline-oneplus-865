@@ -1,0 +1,59 @@
+What:		/sys/bus/platform/devices/*/position
+Date:		October 2026
+KernelVersion:	6.16.7 (local bring-up)
+Description:
+		Read-only decimal position most recently reported by the
+		dual-hall-slider input device: 0, 1 or 2. The initial value is
+		-1 until a valid, debounced measurement has been reported.
+
+		This is the same cache exposed by EVIOCGABS for the configured
+		input axis, not an instantaneous hardware read. It is updated
+		while the input device has an open consumer. The board describes
+		the physical direction; no audio or key policy is assigned.
+		Rejected measurements retain the last reported position.
+
+What:		/sys/bus/platform/devices/*/sample_valid
+Date:		October 2026
+KernelVersion:	6.16.7 (local bring-up)
+Description:
+		Read-only boolean. 1 means the latest poll read both channels,
+		passed the full-scale checks and classified a candidate.
+		0 indicates no current sampling, a transport/range/classification
+		failure, suspend, or pending resampling after calibration.
+
+		A candidate may still be pending debounce. This attribute does
+		not guarantee that the cached position represents an already
+		completed physical transition.
+
+What:		/sys/bus/platform/devices/*/hall_raw
+Date:		October 2026
+KernelVersion:	6.16.7 (local bring-up)
+Description:
+		Read-only pair of fresh signed decimal IIO counts, in end-0,
+		end-2 order. Reads are serialized with polling and calibration.
+		The value is not cached. Failed IIO transfers, magnetic full
+		scale or system suspend result in a read error rather than an
+		invented pair. Per-sensor IIO raw attributes can also be used
+		for diagnostics and expose full-scale values.
+
+What:		/sys/bus/platform/devices/*/calibration
+Date:		October 2026
+KernelVersion:	6.16.7 (local bring-up)
+Description:
+		Root-writable selector calibration. A read returns either
+		"uncalibrated" or six signed decimal counts:
+
+		pos0_end0 pos0_end2 pos1_end0 pos1_end2 pos2_end0 pos2_end2
+
+		Write one complete six-integer set, separated by spaces, commas,
+		tabs or newlines. Values are checked against available channel
+		ranges. Adjacent signed field differences must have consistent
+		ordering and be separated by more than twice the configured
+		hysteresis. Invalid sets are rejected without changing the
+		active calibration. "reset" removes calibration.
+
+		Applying calibration resets pending debounce and requires a
+		new sample; it does not fabricate an input event. Calibration
+		is volatile and has no effect on sensor registers, audio policy
+		or Android persist/NV storage. Userspace can restore a saved
+		set for the same physical device.

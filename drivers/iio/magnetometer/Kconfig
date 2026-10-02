@@ -139,6 +139,18 @@ config MMC35240
 	  To compile this driver as a module, choose M here: the module
 	  will be called mmc35240.
 
+config MXM1120
+	tristate "MXM1120 and IST8801 single-axis Hall sensors"
+	depends on I2C && REGULATOR
+	select REGMAP_I2C
+	help
+	  Support MagnaChip MXM1120 and iSentek IST8801 digital linear
+	  Hall sensors. Each device exposes an independent magnetic IIO
+	  channel with signed 10-bit raw readings and runtime standby.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called mxm1120.
+
 config IIO_ST_MAGN_3AXIS
 	tristate "STMicroelectronics magnetometers 3-Axis Driver"
 	depends on (I2C || SPI_MASTER) && SYSFS
