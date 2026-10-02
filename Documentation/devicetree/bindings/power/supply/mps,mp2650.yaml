@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/mps,mp2650.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Monolithic Power Systems MP2650 battery charger
+
+maintainers:
+  - Mainline OnePlus 8T community <linux-msm@vger.kernel.org>
+
+description: |
+  The MP2650 is a multi-cell switching battery charger with programmable input
+  and charging current limits and ADC channels for input telemetry.
+
+allOf:
+  - $ref: power-supply.yaml#
+
+properties:
+  compatible:
+    const: mps,mp2650
+
+  reg:
+    maxItems: 1
+
+  power-supplies:
+    description: Phandle to the USB Type-C or other input power supply.
+
+  mps,battery-power-supply:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Phandle to the battery fuel gauge used for safety monitoring.
+
+  input-current-limit-microamp:
+    description: Maximum input current the board is allowed to request.
+    minimum: 500000
+    maximum: 3000000
+
+  constant-charge-current-max-microamp:
+    description: Maximum battery charging current allowed by the board.
+    minimum: 100000
+    maximum: 3000000
+
+  mps,enable-charge-control:
+    description: |
+      Allow the driver to program charging limits at probe time. If absent, the
+      device is only monitored until the enable_control module parameter is set.
+    type: boolean
+
+required:
+  - compatible
+  - reg
+  - power-supplies
+  - mps,battery-power-supply
+
+additionalProperties: false
+
+examples:
+  - |
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        charger@5c {
+            compatible = "mps,mp2650";
+            reg = <0x5c>;
+            power-supplies = <&usb_typec>;
+            mps,battery-power-supply = <&fuel_gauge>;
+            input-current-limit-microamp = <2700000>;
+            constant-charge-current-max-microamp = <2400000>;
+        };
+    };

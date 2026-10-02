@@ -545,6 +545,22 @@
 	 */
 };
 
+&i2c5 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	charger@5c {
+		compatible = "mps,mp2650";
+		reg = <0x5c>;
+
+		power-supplies = <&pm8150b_typec>;
+		mps,battery-power-supply = <&bq27541_fg>;
+		input-current-limit-microamp = <2700000>;
+		constant-charge-current-max-microamp = <2400000>;
+		mps,enable-charge-control;
+	};
+};
+
 &i2c15 {
 	clock-frequency = <400000>;
 	status = "okay";

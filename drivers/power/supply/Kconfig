@@ -657,6 +657,19 @@ config CHARGER_MP2629
 	  Battery charger. This driver provides Battery charger power management
 	  functions on the systems.
 
+config CHARGER_MP2650
+	tristate "Monolithic Power Systems MP2650 battery charger"
+	depends on I2C
+	depends on OF
+	select REGMAP_I2C
+	help
+	  Say Y or M here to enable support for the MP2650 multi-cell battery
+	  charger. The driver provides input telemetry and optional conservative,
+	  source-aware charge current control.
+
+	  To compile this driver as a module, choose M here. The module will be
+	  called mp2650_charger.
+
 config CHARGER_MT6360
 	tristate "Mediatek MT6360 Charger Driver"
 	depends on MFD_MT6360
