@@ -307,9 +307,14 @@ struct mhi_controller_config {
  * @fw_sz: Firmware image data size for normal booting, used only if fw_image
  *         is NULL and fbc_download is true (optional)
  * @edl_image: Firmware image name for emergency download mode (optional)
+ * @amss_image: AMSS firmware image name for FBC mode when SBL and AMSS reside
+ *              in separate files (optional). When set, fw_image is uploaded via
+ *              BHI as the SBL, and amss_image is pre-loaded and pushed to the
+ *              device via BHIe when the device signals SBL execution environment.
  * @rddm_size: RAM dump size that host should allocate for debugging purpose
  * @sbl_size: SBL image size downloaded through BHIe (optional)
- * @seg_len: BHIe vector size (optional)
+ * @seg_len: BHIe vector size for normal firmware loading (optional)
+ * @rddm_seg_len: BHIe vector size for RDDM dump collection (optional)
  * @reg_len: Length of the MHI MMIO region (required)
  * @fbc_image: Points to firmware image buffer
  * @rddm_image: Points to RAM dump buffer
@@ -349,12 +354,17 @@ struct mhi_controller_config {
  * @wake_toggle: CB function to assert and de-assert device wake (optional)
  * @runtime_get: CB function to controller runtime resume (required)
  * @runtime_put: CB function to decrement pm usage (required)
+ * @time_get: CB function to return host time in microseconds (optional)
+ * @lpm_disable: CB function to disable link-level low power modes (optional)
+ * @lpm_enable: CB function to re-enable link-level low power modes (optional)
+ * @bw_scale: CB function to honor device bandwidth switch request (optional)
  * @map_single: CB function to create TRE buffer
  * @unmap_single: CB function to destroy TRE buffer
  * @read_reg: Read a MHI register via the physical link (required)
  * @write_reg: Write a MHI register via the physical link (required)
  * @reset: Controller specific reset function (optional)
  * @edl_trigger: CB function to trigger EDL mode (optional)
+ * @priv_data: Opaque controller-private data for callback implementations
  * @buffer_len: Bounce buffer length
  * @index: Index of the MHI controller instance
  * @bounce_buf: Use of bounce buffer
@@ -383,9 +393,11 @@ struct mhi_controller {
 	const u8 *fw_data;
 	size_t fw_sz;
 	const char *edl_image;
+	const char *amss_image;
 	size_t rddm_size;
 	size_t sbl_size;
 	size_t seg_len;
+	size_t rddm_seg_len;
 	size_t reg_len;
 	struct image_info *fbc_image;
 	struct image_info *rddm_image;
@@ -427,8 +439,13 @@ struct mhi_controller {
 	void (*wake_get)(struct mhi_controller *mhi_cntrl, bool override);
 	void (*wake_put)(struct mhi_controller *mhi_cntrl, bool override);
 	void (*wake_toggle)(struct mhi_controller *mhi_cntrl);
-	int (*runtime_get)(struct mhi_controller *mhi_cntrl);
-	void (*runtime_put)(struct mhi_controller *mhi_cntrl);
+	int (*runtime_get)(struct mhi_controller *mhi_cntrl, void *priv);
+	void (*runtime_put)(struct mhi_controller *mhi_cntrl, void *priv);
+	u64 (*time_get)(struct mhi_controller *mhi_cntrl, void *priv);
+	int (*lpm_disable)(struct mhi_controller *mhi_cntrl, void *priv);
+	int (*lpm_enable)(struct mhi_controller *mhi_cntrl, void *priv);
+	int (*bw_scale)(struct mhi_controller *mhi_cntrl,
+			struct mhi_link_info *link_info);
 	int (*map_single)(struct mhi_controller *mhi_cntrl,
 			  struct mhi_buf_info *buf);
 	void (*unmap_single)(struct mhi_controller *mhi_cntrl,
@@ -439,6 +456,7 @@ struct mhi_controller {
 			  u32 val);
 	void (*reset)(struct mhi_controller *mhi_cntrl);
 	int (*edl_trigger)(struct mhi_controller *mhi_cntrl);
+	void *priv_data;
 
 	size_t buffer_len;
 	int index;
@@ -621,6 +639,20 @@ int mhi_get_free_desc_count(struct mhi_device *mhi_dev,
 int mhi_prepare_for_power_up(struct mhi_controller *mhi_cntrl);
 
 /**
+ * mhi_mem_protect - Donate MHI control-path DMA buffers to VMID_MSS_MSA
+ * @mhi_cntrl: MHI controller
+ *
+ * Required on Qualcomm SM8250 platforms with an external SDX55M modem on
+ * PCIe2: TrustZone stage-2 SMMU (SID 0x1d01, CB=12) blocks the modem from
+ * writing to host memory unless the physical pages are donated via SCM.
+ * Call after mhi_prepare_for_power_up() and before mhi_sync_power_up().
+ *
+ * Return: 0 on success, -EOPNOTSUPP if CONFIG_QCOM_SCM is not available,
+ *         or negative errno on failure.
+ */
+int mhi_mem_protect(struct mhi_controller *mhi_cntrl);
+
+/**
  * mhi_async_power_up - Start MHI power up sequence
  * @mhi_cntrl: MHI controller
  */
@@ -714,6 +746,12 @@ enum mhi_ee_type mhi_get_exec_env(struct mhi_controller *mhi_cntrl);
 enum mhi_state mhi_get_mhi_state(struct mhi_controller *mhi_cntrl);
 
 /**
+ * mhi_poll_events - Poll all MHI event rings without MSI
+ * @mhi_cntrl: MHI controller
+ */
+void mhi_poll_events(struct mhi_controller *mhi_cntrl);
+
+/**
  * mhi_soc_reset - Trigger a device reset. This can be used as a last resort
  *		   to reset and recover a device.
  * @mhi_cntrl: MHI controller
@@ -754,6 +792,33 @@ int mhi_prepare_for_transfer(struct mhi_device *mhi_dev);
  * The MHI core will automatically allocate and queue buffers for the DL traffic.
  */
 int mhi_prepare_for_transfer_autoqueue(struct mhi_device *mhi_dev);
+
+/**
+ * mhi_device_configure - configure MHI channel/event contexts
+ * @mhi_dev: Device associated with the channels
+ * @dir: Direction of the channel to configure
+ * @buf: Configuration data array
+ * @elements: Number of configuration elements
+ *
+ * Offload clients use this to install modem-provided CCA/ECA contexts before
+ * preparing an offloaded MHI channel pair for transfer.
+ */
+int mhi_device_configure(struct mhi_device *mhi_dev,
+			 enum dma_data_direction dir,
+			 struct mhi_buf *buf,
+			 int elements);
+
+/**
+ * mhi_get_channel_info - return public channel ids for an MHI device
+ * @mhi_dev: Device associated with the channels
+ * @ul_chan: Filled with uplink channel id, if present
+ * @dl_chan: Filled with downlink channel id, if present
+ * @ul_er: Filled with uplink event ring id, if present
+ * @dl_er: Filled with downlink event ring id, if present
+ */
+void mhi_get_channel_info(struct mhi_device *mhi_dev,
+			  u32 *ul_chan, u32 *dl_chan,
+			  u32 *ul_er, u32 *dl_er);
 
 /**
  * mhi_unprepare_from_transfer - Reset UL and DL channels for data transfer.

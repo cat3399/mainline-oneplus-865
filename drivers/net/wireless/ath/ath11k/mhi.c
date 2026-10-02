@@ -230,12 +230,14 @@ static int ath11k_mhi_get_msi(struct ath11k_pci *ab_pci)
 	return 0;
 }
 
-static int ath11k_mhi_op_runtime_get(struct mhi_controller *mhi_cntrl)
+static int ath11k_mhi_op_runtime_get(struct mhi_controller *mhi_cntrl,
+				     void *priv)
 {
 	return 0;
 }
 
-static void ath11k_mhi_op_runtime_put(struct mhi_controller *mhi_cntrl)
+static void ath11k_mhi_op_runtime_put(struct mhi_controller *mhi_cntrl,
+				      void *priv)
 {
 }
 
@@ -386,6 +388,7 @@ int ath11k_mhi_register(struct ath11k_pci *ab_pci)
 	mhi_ctrl->fbc_download = true;
 	mhi_ctrl->runtime_get = ath11k_mhi_op_runtime_get;
 	mhi_ctrl->runtime_put = ath11k_mhi_op_runtime_put;
+	mhi_ctrl->priv_data = ab_pci;
 	mhi_ctrl->status_cb = ath11k_mhi_op_status_cb;
 	mhi_ctrl->read_reg = ath11k_mhi_op_read_reg;
 	mhi_ctrl->write_reg = ath11k_mhi_op_write_reg;

@@ -7,8 +7,13 @@
 #define _PCIE_QCOM_COMMON_H
 
 struct dw_pcie;
+struct pci_dev;
 
 void qcom_pcie_common_set_16gt_equalization(struct dw_pcie *pci);
 void qcom_pcie_common_set_16gt_lane_margining(struct dw_pcie *pci);
+
+int qcom_pcie_retrain_link(struct pci_dev *pdev);
+int qcom_pcie_perst_toggle(struct pci_dev *pdev);
+int qcom_pcie_relink(struct pci_dev *pdev);
 
 #endif

@@ -29,3 +29,32 @@ config MHI_BUS_PCI_GENERIC
 	  This driver provides MHI PCI controller driver for devices such as
 	  Qualcomm SDX55 based PCIe modems.
 
+config MHI_BUS_SAHARA_MODEM
+	tristate "MHI Sahara modem firmware loader"
+	depends on MHI_BUS
+	help
+	  Driver that implements the Sahara v2 firmware transfer protocol
+	  over MHI channels 2/3.  Required for Qualcomm Fusion modems
+	  (e.g. SDX55 on Xiaomi Mi 10T / Apollo) that have no onboard
+	  flash and load AMSS via Sahara after SBL EE.
+
+config MHI_BUS_BL_LOGGER
+	tristate "MHI boot logger client"
+	depends on MHI_BUS
+	default y if MHI_BUS_PCI_GENERIC
+	help
+	  Driver that drains the SBL boot-logger channel exposed by some
+	  Qualcomm PCIe modems. This is used by vendor SDX55 fusion setups
+	  alongside SAHARA during early boot.
+
+config MHI_BUS_CHAN_KEEPALIVE
+	tristate "MHI control-channel keep-alive (SDX55 Fusion)"
+	depends on MHI_BUS
+	default y if MHI_BUS_PCI_GENERIC
+	help
+	  Open and keep alive the EFS/QMI1/IP_CTRL MHI channels exposed by
+	  the SDX55 Fusion AMSS execution environment.  Vendor kernels open
+	  these via DT-defined client mappings; mainline declares them in
+	  the controller config but no in-tree client binds, so the channels
+	  are never STARTed.  Used as a hypothesis test for whether channel
+	  completeness affects post-MISSION modem stability on Apollo.

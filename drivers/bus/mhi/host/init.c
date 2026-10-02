@@ -18,6 +18,10 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/wait.h>
+#if IS_REACHABLE(CONFIG_QCOM_SCM)
+#include <dt-bindings/firmware/qcom,scm.h>
+#include <linux/firmware/qcom/qcom_scm.h>
+#endif
 #include "internal.h"
 
 #define CREATE_TRACE_POINTS
@@ -98,6 +102,13 @@ static ssize_t oem_pk_hash_show(struct device *dev,
 	struct mhi_controller *mhi_cntrl = mhi_dev->mhi_cntrl;
 	u32 hash_segment[MHI_MAX_OEM_PK_HASH_SEGMENTS];
 	int i, cnt = 0, ret;
+
+	/*
+	 * The BHI window is torn down by mhi_unprepare_after_power_down(), so
+	 * a read racing with (or following) a crash would dereference NULL.
+	 */
+	if (!mhi_cntrl->bhi)
+		return -ENODEV;
 
 	for (i = 0; i < MHI_MAX_OEM_PK_HASH_SEGMENTS; i++) {
 		ret = mhi_read_reg(mhi_cntrl, mhi_cntrl->bhi, BHI_OEMPKHASH(i), &hash_segment[i]);
@@ -538,7 +549,12 @@ int mhi_init_mmio(struct mhi_controller *mhi_cntrl)
 		{0, 0}
 	};
 
-	dev_dbg(dev, "Initializing MHI registers\n");
+	dev_info(dev, "Initializing MHI registers\n");
+	dev_info(dev, "MMIO ctxt addrs: CCABAP=0x%llx ECABAP=0x%llx CRCBAP=0x%llx iova=[0x%llx-0x%llx]\n",
+		 mhi_cntrl->mhi_ctxt->chan_ctxt_addr,
+		 mhi_cntrl->mhi_ctxt->er_ctxt_addr,
+		 mhi_cntrl->mhi_ctxt->cmd_ctxt_addr,
+		 mhi_cntrl->iova_start, mhi_cntrl->iova_stop);
 
 	/* Read channel db offset */
 	ret = mhi_get_channel_doorbell_offset(mhi_cntrl, &val);
@@ -1174,7 +1190,8 @@ int mhi_prepare_for_power_up(struct mhi_controller *mhi_cntrl)
 		 * Allocate RDDM table for debugging purpose if specified
 		 */
 		mhi_alloc_bhie_table(mhi_cntrl, &mhi_cntrl->rddm_image,
-				     mhi_cntrl->rddm_size);
+				     mhi_cntrl->rddm_size,
+				     mhi_cntrl->rddm_seg_len);
 		if (mhi_cntrl->rddm_image) {
 			ret = mhi_rddm_prepare(mhi_cntrl,
 					       mhi_cntrl->rddm_image);
@@ -1199,6 +1216,161 @@ error_dev_ctxt:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(mhi_prepare_for_power_up);
+
+/**
+ * mhi_mem_protect - donate MHI control-path DMA buffers to VMID_MSS_MSA
+ * @mhi_cntrl: MHI controller
+ *
+ * On SM8250 platforms with an external SDX55M modem connected via PCIe2,
+ * TrustZone stage-2 SMMU context bank 12 (SID 0x1d01) blocks the modem from
+ * DMA-writing to host memory unless the physical pages have been explicitly
+ * donated to VMID_MSS_MSA via qcom_scm_assign_mem().
+ *
+ * Call this after mhi_prepare_for_power_up() (which allocates the rings) and
+ * before mhi_sync_power_up() (which starts the modem and allows it to write
+ * to event rings).
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+/*
+ * Helper: share a memory region with the modem VMID via TZ SCM call.
+ * qcom_scm_assign_mem requires page-aligned physical addresses.
+ *
+ * dma_alloc_coherent with IOMMU returns vmalloc-space addresses, so
+ * virt_to_phys() does NOT work.  We must use vmalloc_to_page() per page
+ * to resolve the real physical address.
+ */
+#if IS_REACHABLE(CONFIG_QCOM_SCM)
+#include <linux/vmalloc.h>
+
+/* Pages already shared with MSS — avoids double-assign on overlapping pages */
+#define MHI_SCM_MAX_PAGES 64
+
+static phys_addr_t mhi_virt_to_phys(void *vaddr)
+{
+	if (is_vmalloc_addr(vaddr))
+		return page_to_phys(vmalloc_to_page(vaddr)) + offset_in_page(vaddr);
+	return virt_to_phys(vaddr);
+}
+
+static int mhi_scm_share(struct device *dev, void *vaddr, size_t size,
+			 const struct qcom_scm_vmperm *newvm, int dest_cnt,
+			 phys_addr_t *done_pages, int *done_cnt)
+{
+	unsigned int nr_pages = PAGE_ALIGN(offset_in_page(vaddr) + size) >> PAGE_SHIFT;
+	void *cur = (void *)((unsigned long)vaddr & PAGE_MASK);
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < nr_pages; i++, cur += PAGE_SIZE) {
+		phys_addr_t phys = mhi_virt_to_phys(cur);
+		int j, already = 0;
+		u64 srcvm;
+
+		for (j = 0; j < *done_cnt; j++) {
+			if (done_pages[j] == phys) {
+				already = 1;
+				break;
+			}
+		}
+		if (already)
+			continue;
+
+		srcvm = BIT(QCOM_SCM_VMID_HLOS);
+		ret = qcom_scm_assign_mem(phys, PAGE_SIZE, &srcvm, newvm, dest_cnt);
+		if (ret) {
+			dev_err(dev, "mhi_scm_share: phys %pa failed: %d\n",
+				&phys, ret);
+			return ret;
+		}
+		if (*done_cnt < MHI_SCM_MAX_PAGES)
+			done_pages[(*done_cnt)++] = phys;
+	}
+	return 0;
+}
+#endif
+
+int mhi_mem_protect(struct mhi_controller *mhi_cntrl)
+{
+#if IS_REACHABLE(CONFIG_QCOM_SCM)
+	struct mhi_ctxt *mhi_ctxt = mhi_cntrl->mhi_ctxt;
+	struct mhi_event *mhi_event;
+	struct mhi_cmd *mhi_cmd;
+	struct device *dev = &mhi_cntrl->mhi_dev->dev;
+	const struct qcom_scm_vmperm newvm[2] = {
+		{ QCOM_SCM_VMID_HLOS,    QCOM_SCM_PERM_RW },
+		{ QCOM_SCM_VMID_MSS_MSA, QCOM_SCM_PERM_RW },
+	};
+	phys_addr_t done_pages[MHI_SCM_MAX_PAGES];
+	int done_cnt = 0;
+	int i, ret;
+
+	if (!mhi_ctxt)
+		return -EINVAL;
+
+	/* Event context table (modem reads ring base/len, writes rp/wp) */
+	ret = mhi_scm_share(dev, mhi_ctxt->er_ctxt,
+			    sizeof(*mhi_ctxt->er_ctxt) * mhi_cntrl->total_ev_rings,
+			    newvm, 2, done_pages, &done_cnt);
+	if (ret) {
+		dev_err(dev, "mhi_mem_protect: er_ctxt failed: %d\n", ret);
+		return ret;
+	}
+
+	/* Event ring TRE buffers (modem writes completion events here) */
+	mhi_event = mhi_cntrl->mhi_event;
+	for (i = 0; i < mhi_cntrl->total_ev_rings; i++, mhi_event++) {
+		if (mhi_event->offload_ev)
+			continue;
+		ret = mhi_scm_share(dev, mhi_event->ring.pre_aligned,
+				    mhi_event->ring.alloc_size,
+				    newvm, 2, done_pages, &done_cnt);
+		if (ret) {
+			dev_err(dev, "mhi_mem_protect: event ring %d failed: %d\n",
+				i, ret);
+			return ret;
+		}
+	}
+
+	/* Channel context table (modem reads ring base/len/rp/wp) */
+	ret = mhi_scm_share(dev, mhi_ctxt->chan_ctxt,
+			    sizeof(*mhi_ctxt->chan_ctxt) * mhi_cntrl->max_chan,
+			    newvm, 2, done_pages, &done_cnt);
+	if (ret) {
+		dev_err(dev, "mhi_mem_protect: chan_ctxt failed: %d\n", ret);
+		return ret;
+	}
+
+	/* Command context table */
+	ret = mhi_scm_share(dev, mhi_ctxt->cmd_ctxt,
+			    sizeof(*mhi_ctxt->cmd_ctxt) * NR_OF_CMD_RINGS,
+			    newvm, 2, done_pages, &done_cnt);
+	if (ret) {
+		dev_err(dev, "mhi_mem_protect: cmd_ctxt failed: %d\n", ret);
+		return ret;
+	}
+
+	/* Command ring TRE buffers */
+	mhi_cmd = mhi_cntrl->mhi_cmd;
+	for (i = 0; i < NR_OF_CMD_RINGS; i++, mhi_cmd++) {
+		ret = mhi_scm_share(dev, mhi_cmd->ring.pre_aligned,
+				    mhi_cmd->ring.alloc_size,
+				    newvm, 2, done_pages, &done_cnt);
+		if (ret) {
+			dev_err(dev, "mhi_mem_protect: cmd ring %d failed: %d\n",
+				i, ret);
+			return ret;
+		}
+	}
+
+	dev_info(dev, "MHI DMA buffers shared with VMID_MSS_MSA (%d pages)\n",
+		 done_cnt);
+	return 0;
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+EXPORT_SYMBOL_GPL(mhi_mem_protect);
 
 void mhi_unprepare_after_power_down(struct mhi_controller *mhi_cntrl)
 {

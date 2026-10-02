@@ -197,7 +197,13 @@ int mhi_ready_state_transition(struct mhi_controller *mhi_cntrl)
 				 MHISTATUS_READY_MASK, 1, interval_us,
 				 timeout_ms);
 	if (ret) {
-		dev_err(dev, "Device failed to enter MHI Ready\n");
+		u32 ctrl_val = 0, status_val = 0;
+		if (mhi_read_reg(mhi_cntrl, mhi_cntrl->regs, MHICTRL, &ctrl_val))
+			ctrl_val = ~0U;
+		if (mhi_read_reg(mhi_cntrl, mhi_cntrl->regs, MHISTATUS, &status_val))
+			status_val = ~0U;
+		dev_err(dev, "Device failed to enter MHI Ready: MHICTRL=%#010x MHISTATUS=%#010x\n",
+			ctrl_val, status_val);
 		return ret;
 	}
 
@@ -249,6 +255,7 @@ int mhi_ready_state_transition(struct mhi_controller *mhi_cntrl)
 
 	/* Set MHI to M0 state */
 	mhi_set_mhi_state(mhi_cntrl, MHI_STATE_M0);
+
 	read_unlock_bh(&mhi_cntrl->pm_lock);
 
 	return 0;
@@ -873,8 +880,13 @@ int mhi_pm_suspend(struct mhi_controller *mhi_cntrl)
 
 	/* Return busy if there are any pending resources */
 	if (atomic_read(&mhi_cntrl->dev_wake) ||
-	    atomic_read(&mhi_cntrl->pending_pkts))
+	    atomic_read(&mhi_cntrl->pending_pkts)) {
+		dev_info(dev,
+			 "mhi_pm_suspend: EBUSY dev_wake=%d pending_pkts=%d\n",
+			 atomic_read(&mhi_cntrl->dev_wake),
+			 atomic_read(&mhi_cntrl->pending_pkts));
 		return -EBUSY;
+	}
 
 	/* Take MHI out of M2 state */
 	read_lock_bh(&mhi_cntrl->pm_lock);
@@ -1153,8 +1165,8 @@ int mhi_async_power_up(struct mhi_controller *mhi_cntrl)
 	}
 
 	state = mhi_get_mhi_state(mhi_cntrl);
-	dev_dbg(dev, "Attempting power on with EE: %s, state: %s\n",
-		TO_MHI_EXEC_STR(current_ee), mhi_state_str(state));
+	dev_info(dev, "Power on: EE=%s state=%s\n",
+		 TO_MHI_EXEC_STR(current_ee), mhi_state_str(state));
 
 	if (state == MHI_STATE_SYS_ERR) {
 		mhi_set_mhi_state(mhi_cntrl, MHI_STATE_RESET);

@@ -1285,6 +1285,137 @@ static void qcom_pcie_host_deinit(struct dw_pcie_rp *pp)
 	pcie->cfg->ops->deinit(pcie);
 }
 
+/*
+ * External SDX55 recovery, adapted from royka1/apollo-linux (apollo-6.17).
+ * Linux 6.16 has a single PHY per controller, unlike the newer port helpers.
+ * These entry points must never reset the root complex of a live endpoint.
+ */
+static struct qcom_pcie *qcom_pcie_modem_controller(struct pci_dev *pdev)
+{
+	struct pci_host_bridge *host = pci_find_host_bridge(pdev->bus);
+	struct device *dev = host->dev.parent;
+
+	if (!dev || !dev->driver || strcmp(dev->driver->name, "qcom-pcie") ||
+	    !of_device_is_compatible(dev->of_node, "qcom,pcie-sm8250"))
+		return ERR_PTR(-EOPNOTSUPP);
+
+	return dev_get_drvdata(dev);
+}
+
+int qcom_pcie_retrain_link(struct pci_dev *pdev)
+{
+	struct qcom_pcie *pcie = qcom_pcie_modem_controller(pdev);
+	struct dw_pcie *pci;
+	u32 val;
+	int ret, retries;
+
+	if (IS_ERR(pcie))
+		return PTR_ERR(pcie);
+	pci = pcie->pci;
+	if (dw_pcie_link_up(pci))
+		return 0;
+
+	/* Preserve the endpoint's boot stage: do not assert PERST# here. */
+	val = readl(pcie->parf + PARF_LTSSM);
+	writel(val & ~LTSSM_EN, pcie->parf + PARF_LTSSM);
+	phy_power_off(pcie->phy);
+	pcie->cfg->ops->deinit(pcie);
+	msleep(5);
+
+	ret = pcie->cfg->ops->init(pcie);
+	if (ret)
+		return ret;
+	ret = phy_set_mode_ext(pcie->phy, PHY_MODE_PCIE, PHY_MODE_PCIE_RC);
+	if (ret)
+		goto err_deinit;
+	ret = phy_power_on(pcie->phy);
+	if (ret)
+		goto err_deinit;
+	if (pcie->cfg->ops->post_init) {
+		ret = pcie->cfg->ops->post_init(pcie);
+		if (ret)
+			goto err_phy;
+	}
+	if (pcie->cfg->ops->config_sid) {
+		ret = pcie->cfg->ops->config_sid(pcie);
+		if (ret)
+			goto err_phy;
+	}
+	ret = dw_pcie_setup_rc(&pci->pp);
+	if (ret)
+		goto err_phy;
+	ret = dw_pcie_start_link(pci);
+	if (ret)
+		goto err_phy;
+	for (retries = 0; retries < 100; retries++) {
+		if (dw_pcie_link_up(pci))
+			return 0;
+		msleep(100);
+	}
+	return -ETIMEDOUT;
+
+err_phy:
+	phy_power_off(pcie->phy);
+err_deinit:
+	pcie->cfg->ops->deinit(pcie);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(qcom_pcie_retrain_link);
+
+int qcom_pcie_perst_toggle(struct pci_dev *pdev)
+{
+	struct qcom_pcie *pcie = qcom_pcie_modem_controller(pdev);
+	struct dw_pcie *pci;
+	u32 val;
+	int retries;
+
+	if (IS_ERR(pcie))
+		return PTR_ERR(pcie);
+	pci = pcie->pci;
+	if (dw_pcie_link_up(pci))
+		return -EBUSY;
+
+	val = readl(pcie->parf + PARF_LTSSM);
+	writel(val & ~LTSSM_EN, pcie->parf + PARF_LTSSM);
+	qcom_ep_reset_assert(pcie);
+	msleep(PCIE_T_PVPERL_MS + 50);
+	qcom_ep_reset_deassert(pcie);
+	writel(val | LTSSM_EN, pcie->parf + PARF_LTSSM);
+	for (retries = 0; retries < 100; retries++) {
+		if (dw_pcie_link_up(pci))
+			return 0;
+		msleep(100);
+	}
+	return -ETIMEDOUT;
+}
+EXPORT_SYMBOL_GPL(qcom_pcie_perst_toggle);
+
+int qcom_pcie_relink(struct pci_dev *pdev)
+{
+	struct qcom_pcie *pcie = qcom_pcie_modem_controller(pdev);
+	struct dw_pcie *pci;
+	int ret;
+
+	if (IS_ERR(pcie))
+		return PTR_ERR(pcie);
+	pci = pcie->pci;
+	if (dw_pcie_link_up(pci))
+		return 0;
+
+	qcom_pcie_host_deinit(&pci->pp);
+	ret = qcom_pcie_host_init(&pci->pp);
+	if (ret)
+		return ret;
+	ret = dw_pcie_setup_rc(&pci->pp);
+	if (ret)
+		return ret;
+	ret = dw_pcie_start_link(pci);
+	if (ret)
+		return ret;
+	return dw_pcie_wait_for_link(pci);
+}
+EXPORT_SYMBOL_GPL(qcom_pcie_relink);
+
 static void qcom_pcie_host_post_init(struct dw_pcie_rp *pp)
 {
 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);

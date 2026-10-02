@@ -324,7 +324,7 @@ int mhi_destroy_device(struct device *dev, void *data)
 	}
 
 	dev_dbg(&mhi_cntrl->mhi_dev->dev, "destroy device for chan:%s\n",
-		 mhi_dev->name);
+		mhi_dev->name);
 
 	/* Notify the client and remove the device from MHI bus */
 	device_del(dev);
@@ -477,6 +477,36 @@ irqreturn_t mhi_irq_handler(int irq_number, void *dev)
 
 	return IRQ_HANDLED;
 }
+
+/**
+ * mhi_poll_events - Poll all MHI event rings and state change vector
+ * @mhi_cntrl: MHI controller to poll
+ *
+ * This is used as a workaround when MSI delivery is non-functional (e.g.
+ * on Qualcomm SM8250 where the SMMU TBU intercepts MSI TLPs before the
+ * DW PCIe iMSI-RX module can catch them).  Call this periodically from
+ * a timer to process pending events without MSI.
+ */
+void mhi_poll_events(struct mhi_controller *mhi_cntrl)
+{
+	struct mhi_event *mhi_event;
+	int i;
+
+	/* Simulate BHI/state-change vector: wake up state waiters */
+	wake_up_all(&mhi_cntrl->state_event);
+
+	/* Poll each event ring */
+	if (!mhi_cntrl->mhi_ctxt)
+		return;
+
+	mhi_event = mhi_cntrl->mhi_event;
+	for (i = 0; i < mhi_cntrl->total_ev_rings; i++, mhi_event++) {
+		if (mhi_event->offload_ev)
+			continue;
+		mhi_irq_handler(0, mhi_event);
+	}
+}
+EXPORT_SYMBOL_GPL(mhi_poll_events);
 
 irqreturn_t mhi_intvec_threaded_handler(int irq_number, void *priv)
 {
@@ -648,6 +678,24 @@ static int parse_xfer_event(struct mhi_controller *mhi_cntrl,
 			/* truncate to buf len if xfer_len is larger */
 			result.bytes_xferd =
 				min_t(u16, xfer_len, buf_info->len);
+
+			/* SDX55 silent-window probe: dump IPCR DL payload */
+			if (mhi_cntrl->ee == MHI_EE_AMSS &&
+			    mhi_chan->dir == DMA_FROM_DEVICE &&
+			    (mhi_chan->chan == 20 || mhi_chan->chan == 21) &&
+			    result.bytes_xferd && buf_info->cb_buf) {
+				size_t dlen = min_t(size_t,
+						    result.bytes_xferd, 48);
+
+				dev_dbg(dev,
+					"IPCR DL ch=%s(%d) len=%zu\n",
+					mhi_chan->name, mhi_chan->chan,
+					result.bytes_xferd);
+				print_hex_dump_debug("ipcr DL ",
+						     DUMP_PREFIX_OFFSET, 16, 1,
+						     buf_info->cb_buf, dlen, true);
+			}
+
 			mhi_del_ring_element(mhi_cntrl, buf_ring);
 			mhi_del_ring_element(mhi_cntrl, tre_ring);
 			local_rp = tre_ring->rp;
@@ -658,9 +706,15 @@ static int parse_xfer_event(struct mhi_controller *mhi_cntrl,
 			mhi_chan->xfer_cb(mhi_chan->mhi_dev, &result);
 
 			if (mhi_chan->dir == DMA_TO_DEVICE) {
-				atomic_dec(&mhi_cntrl->pending_pkts);
+				int pending = atomic_dec_return(&mhi_cntrl->pending_pkts);
+
+				if (mhi_cntrl->ee == MHI_EE_AMSS && pending < 16)
+					dev_dbg(&mhi_cntrl->mhi_dev->dev,
+						"pending_pkts-- ch=%s pending=%d status=%d\n",
+						mhi_chan->name, pending,
+						result.transaction_status);
 				/* Release the reference got from mhi_queue() */
-				mhi_cntrl->runtime_put(mhi_cntrl);
+				mhi_cntrl->runtime_put(mhi_cntrl, mhi_cntrl->priv_data);
 			}
 
 			/*
@@ -848,10 +902,23 @@ int mhi_process_ctrl_ev_ring(struct mhi_controller *mhi_cntrl,
 
 		trace_mhi_ctrl_event(mhi_cntrl, local_rp);
 
+		/*
+		 * Apollo SDX55 diagnostic: dump every ctrl event so we can see
+		 * firmware-originated requests (TSYNC, BW_REQ, unhandled types)
+		 * in the window between mission mode and ERRFATAL.
+		 */
+		dev_dbg(dev,
+			"CTRL EV er=%u type=0x%02x ptr=0x%llx d0=0x%08x d1=0x%08x\n",
+			mhi_event->er_index, (unsigned int)type,
+			(unsigned long long)le64_to_cpu(local_rp->ptr),
+			le32_to_cpu(local_rp->dword[0]),
+			le32_to_cpu(local_rp->dword[1]));
+
 		switch (type) {
 		case MHI_PKT_TYPE_BW_REQ_EVENT:
 		{
 			struct mhi_link_info *link_info;
+			int ret;
 
 			link_info = &mhi_cntrl->mhi_link_info;
 			write_lock_irq(&mhi_cntrl->pm_lock);
@@ -860,8 +927,20 @@ int mhi_process_ctrl_ev_ring(struct mhi_controller *mhi_cntrl,
 			link_info->target_link_width =
 				MHI_TRE_GET_EV_LINKWIDTH(local_rp);
 			write_unlock_irq(&mhi_cntrl->pm_lock);
-			dev_dbg(dev, "Received BW_REQ event\n");
-			mhi_cntrl->status_cb(mhi_cntrl, MHI_CB_BW_REQ);
+			dev_info(dev,
+				 "BW_REQ event: target_speed=%u target_width=%u\n",
+				 link_info->target_link_speed,
+				 link_info->target_link_width);
+			if (mhi_cntrl->bw_scale) {
+				ret = mhi_cntrl->bw_scale(mhi_cntrl, link_info);
+				if (ret)
+					dev_warn(dev,
+						 "BW_REQ callback failed: %d (speed=%u width=%u)\n",
+						 ret, link_info->target_link_speed,
+						 link_info->target_link_width);
+			} else {
+				mhi_cntrl->status_cb(mhi_cntrl, MHI_CB_BW_REQ);
+			}
 			break;
 		}
 		case MHI_PKT_TYPE_STATE_CHANGE_EVENT:
@@ -911,8 +990,8 @@ int mhi_process_ctrl_ev_ring(struct mhi_controller *mhi_cntrl,
 			enum dev_st_transition st = DEV_ST_TRANSITION_MAX;
 			enum mhi_ee_type event = MHI_TRE_GET_EV_EXECENV(local_rp);
 
-			dev_dbg(dev, "Received EE event: %s\n",
-				TO_MHI_EXEC_STR(event));
+			dev_info(dev, "Received EE event: %s\n",
+				 TO_MHI_EXEC_STR(event));
 			switch (event) {
 			case MHI_EE_SBL:
 				st = DEV_ST_TRANSITION_SBL;
@@ -957,7 +1036,12 @@ int mhi_process_ctrl_ev_ring(struct mhi_controller *mhi_cntrl,
 			}
 			break;
 		default:
-			dev_err(dev, "Unhandled event type: %d\n", type);
+			dev_warn(dev,
+				 "Unhandled ctrl event type: 0x%02x d0=0x%08x d1=0x%08x (er=%u)\n",
+				 (unsigned int)type,
+				 le32_to_cpu(local_rp->dword[0]),
+				 le32_to_cpu(local_rp->dword[1]),
+				 mhi_event->er_index);
 			break;
 		}
 
@@ -1018,6 +1102,24 @@ int mhi_process_data_event_ring(struct mhi_controller *mhi_cntrl,
 		chan = MHI_TRE_GET_EV_CHID(local_rp);
 
 		WARN_ON(chan >= mhi_cntrl->max_chan);
+
+		/*
+		 * Apollo SDX55 diagnostic: catch any non-TX events landing on
+		 * the data event ring (TSYNC, BW_REQ, etc.) so we can see
+		 * firmware-originated requests we are not responding to.
+		 */
+		if (type != MHI_PKT_TYPE_TX_EVENT &&
+		    type != MHI_PKT_TYPE_RSC_TX_EVENT) {
+			struct device *ddev = &mhi_cntrl->mhi_dev->dev;
+
+			dev_warn(ddev,
+				 "DATA EV er=%u type=0x%02x chan=%u ptr=0x%llx d0=0x%08x d1=0x%08x\n",
+				 mhi_event->er_index, (unsigned int)type,
+				 chan,
+				 (unsigned long long)le64_to_cpu(local_rp->ptr),
+				 le32_to_cpu(local_rp->dword[0]),
+				 le32_to_cpu(local_rp->dword[1]));
+		}
 
 		/*
 		 * Only process the event ring elements whose channel
@@ -1154,19 +1256,40 @@ static int mhi_queue(struct mhi_device *mhi_dev, struct mhi_buf_info *buf_info,
 	 * for host->device buffer, balanced put is done on buffer completion
 	 * for device->host buffer, balanced put is after ringing the DB
 	 */
-	mhi_cntrl->runtime_get(mhi_cntrl);
+	mhi_cntrl->runtime_get(mhi_cntrl, mhi_cntrl->priv_data);
 
 	/* Assert dev_wake (to exit/prevent M1/M2)*/
 	mhi_cntrl->wake_toggle(mhi_cntrl);
 
-	if (mhi_chan->dir == DMA_TO_DEVICE)
-		atomic_inc(&mhi_cntrl->pending_pkts);
+	if (mhi_chan->dir == DMA_TO_DEVICE) {
+		int pending = atomic_inc_return(&mhi_cntrl->pending_pkts);
+
+		if (mhi_cntrl->ee == MHI_EE_AMSS && pending <= 16)
+			dev_dbg(&mhi_cntrl->mhi_dev->dev,
+				"pending_pkts++ ch=%s pending=%d mflags=0x%x\n",
+				mhi_chan->name, pending, mflags);
+
+		/* SDX55 silent-window probe: dump IPCR UL payload */
+		if (mhi_cntrl->ee == MHI_EE_AMSS &&
+		    (mhi_chan->chan == 20 || mhi_chan->chan == 21) &&
+		    buf_info->v_addr && buf_info->len) {
+			size_t dlen = min_t(size_t, buf_info->len, 48);
+
+			dev_dbg(&mhi_cntrl->mhi_dev->dev,
+				"IPCR UL ch=%s(%d) len=%zu\n",
+				mhi_chan->name, mhi_chan->chan,
+				buf_info->len);
+			print_hex_dump_debug("ipcr UL ",
+					     DUMP_PREFIX_OFFSET, 16, 1,
+					     buf_info->v_addr, dlen, true);
+		}
+	}
 
 	if (likely(MHI_DB_ACCESS_VALID(mhi_cntrl)))
 		mhi_ring_chan_db(mhi_cntrl, mhi_chan);
 
 	if (dir == DMA_FROM_DEVICE)
-		mhi_cntrl->runtime_put(mhi_cntrl);
+		mhi_cntrl->runtime_put(mhi_cntrl, mhi_cntrl->priv_data);
 
 	read_unlock_irqrestore(&mhi_cntrl->pm_lock, flags);
 
@@ -1319,8 +1442,14 @@ int mhi_send_cmd(struct mhi_controller *mhi_cntrl,
 	/* queue to hardware */
 	mhi_add_ring_element(mhi_cntrl, ring);
 	read_lock_bh(&mhi_cntrl->pm_lock);
-	if (likely(MHI_DB_ACCESS_VALID(mhi_cntrl)))
+	if (likely(MHI_DB_ACCESS_VALID(mhi_cntrl))) {
 		mhi_ring_cmd_db(mhi_cntrl, mhi_cmd);
+		dev_dbg(dev, "CMD ring DB rung: cmd=%d chan=%d PM=%s\n",
+			cmd, chan, to_mhi_pm_state_str(mhi_cntrl->pm_state));
+	} else {
+		dev_err(dev, "CMD ring DB skipped! PM=%s\n",
+			to_mhi_pm_state_str(mhi_cntrl->pm_state));
+	}
 	read_unlock_bh(&mhi_cntrl->pm_lock);
 	spin_unlock_bh(&mhi_cmd->lock);
 
@@ -1373,7 +1502,7 @@ static int mhi_update_channel_state(struct mhi_controller *mhi_cntrl,
 	ret = mhi_device_get_sync(mhi_cntrl->mhi_dev);
 	if (ret)
 		return ret;
-	mhi_cntrl->runtime_get(mhi_cntrl);
+	mhi_cntrl->runtime_get(mhi_cntrl, mhi_cntrl->priv_data);
 
 	reinit_completion(&mhi_chan->completion);
 	ret = mhi_send_cmd(mhi_cntrl, mhi_chan, cmd);
@@ -1387,8 +1516,10 @@ static int mhi_update_channel_state(struct mhi_controller *mhi_cntrl,
 				       msecs_to_jiffies(mhi_cntrl->timeout_ms));
 	if (!ret || mhi_chan->ccs != MHI_EV_CC_SUCCESS) {
 		dev_err(dev,
-			"%d: Failed to receive %s channel command completion\n",
-			mhi_chan->chan, TO_CH_STATE_TYPE_STR(to_state));
+			"%d: Failed to receive %s channel command completion: %s (ret=%d ccs=%d timeout_ms=%u)\n",
+			mhi_chan->chan, TO_CH_STATE_TYPE_STR(to_state),
+			ret ? "bad status" : "timeout",
+			ret, mhi_chan->ccs, mhi_cntrl->timeout_ms);
 		ret = -EIO;
 		goto exit_channel_update;
 	}
@@ -1404,7 +1535,7 @@ static int mhi_update_channel_state(struct mhi_controller *mhi_cntrl,
 
 	trace_mhi_channel_command_end(mhi_cntrl, mhi_chan, to_state, TPS("Updated"));
 exit_channel_update:
-	mhi_cntrl->runtime_put(mhi_cntrl);
+	mhi_cntrl->runtime_put(mhi_cntrl, mhi_cntrl->priv_data);
 	mhi_device_put(mhi_cntrl->mhi_dev);
 
 	return ret;
@@ -1588,9 +1719,14 @@ static void mhi_reset_data_chan(struct mhi_controller *mhi_cntrl,
 		struct mhi_buf_info *buf_info = buf_ring->rp;
 
 		if (mhi_chan->dir == DMA_TO_DEVICE) {
-			atomic_dec(&mhi_cntrl->pending_pkts);
+			int pending = atomic_dec_return(&mhi_cntrl->pending_pkts);
+
+			if (mhi_cntrl->ee == MHI_EE_AMSS && pending < 16)
+				dev_dbg(&mhi_cntrl->mhi_dev->dev,
+					"pending_pkts-- reset ch=%s pending=%d\n",
+					mhi_chan->name, pending);
 			/* Release the reference got from mhi_queue() */
-			mhi_cntrl->runtime_put(mhi_cntrl);
+			mhi_cntrl->runtime_put(mhi_cntrl, mhi_cntrl->priv_data);
 		}
 
 		if (!buf_info->pre_mapped)
@@ -1670,6 +1806,76 @@ int mhi_prepare_for_transfer_autoqueue(struct mhi_device *mhi_dev)
 	return __mhi_prepare_for_transfer(mhi_dev, MHI_CH_INBOUND_ALLOC_BUFS);
 }
 EXPORT_SYMBOL_GPL(mhi_prepare_for_transfer_autoqueue);
+
+int mhi_device_configure(struct mhi_device *mhi_dev,
+			 enum dma_data_direction dir,
+			 struct mhi_buf *buf,
+			 int elements)
+{
+	struct mhi_controller *mhi_cntrl = mhi_dev->mhi_cntrl;
+	struct mhi_chan_ctxt *chan_ctxt;
+	struct mhi_event_ctxt *er_ctxt;
+	struct mhi_chan *mhi_chan;
+
+	switch (dir) {
+	case DMA_TO_DEVICE:
+		mhi_chan = mhi_dev->ul_chan;
+		break;
+	case DMA_FROM_DEVICE:
+	case DMA_BIDIRECTIONAL:
+	case DMA_NONE:
+		mhi_chan = mhi_dev->dl_chan;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (!mhi_chan)
+		return -ENODEV;
+
+	for (; elements > 0; elements--, buf++) {
+		if (!strcmp(buf->name, "ECA")) {
+			if (buf->len != sizeof(*er_ctxt))
+				return -EINVAL;
+
+			er_ctxt = &mhi_cntrl->mhi_ctxt->er_ctxt[mhi_chan->er_index];
+			memcpy(er_ctxt, buf->buf, sizeof(*er_ctxt));
+			continue;
+		}
+
+		if (!strcmp(buf->name, "CCA")) {
+			if (buf->len != sizeof(*chan_ctxt))
+				return -EINVAL;
+
+			chan_ctxt = &mhi_cntrl->mhi_ctxt->chan_ctxt[mhi_chan->chan];
+			memcpy(chan_ctxt, buf->buf, sizeof(*chan_ctxt));
+			continue;
+		}
+
+		return -EINVAL;
+	}
+
+	/* Make context writes visible before the channel is started. */
+	smp_wmb();
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mhi_device_configure);
+
+void mhi_get_channel_info(struct mhi_device *mhi_dev,
+			  u32 *ul_chan, u32 *dl_chan,
+			  u32 *ul_er, u32 *dl_er)
+{
+	if (ul_chan)
+		*ul_chan = mhi_dev->ul_chan ? mhi_dev->ul_chan->chan : U32_MAX;
+	if (dl_chan)
+		*dl_chan = mhi_dev->dl_chan ? mhi_dev->dl_chan->chan : U32_MAX;
+	if (ul_er)
+		*ul_er = mhi_dev->ul_chan ? mhi_dev->ul_chan->er_index : U32_MAX;
+	if (dl_er)
+		*dl_er = mhi_dev->dl_chan ? mhi_dev->dl_chan->er_index : U32_MAX;
+}
+EXPORT_SYMBOL_GPL(mhi_get_channel_info);
 
 void mhi_unprepare_from_transfer(struct mhi_device *mhi_dev)
 {
