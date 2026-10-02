@@ -4,6 +4,7 @@
 #include <linux/mhi.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/string.h>
 #include <linux/wwan.h>
 
 /* MHI wwan flags */
@@ -36,7 +37,51 @@ struct mhi_wwan_dev {
 	 * decremented on data queueing and incremented on data release.
 	 */
 	unsigned int rx_budget;
+	bool is_qmi;
+
+	/* Debug counters for narrowing down stuck early-QMI requests */
+	unsigned int dbg_tx_cnt;
+	unsigned int dbg_rx_cnt;
 };
+
+#define MHI_WWAN_QMI_DBG_LIMIT	16
+#define MHI_WWAN_QMI_DBG_BYTES	64
+
+static bool mhi_wwan_is_qmi(struct mhi_wwan_dev *mhiwwan)
+{
+	return mhiwwan->is_qmi;
+}
+
+static bool mhi_wwan_skip_raw_qmi(struct mhi_device *mhi_dev,
+				  const struct mhi_device_id *id)
+{
+	/*
+	 * Historical workaround: Apollo SDX55 fusion accepted QMI requests
+	 * but never replied (no-reply ERRFATAL chain) when the modem was fed
+	 * dummy EFS via Sahara, because the modem-side QMI dispatcher needs
+	 * NV state.  With real EFS images served from /lib/firmware/sdx55m/
+	 * (sourced from mdm1m9kefs1/2/3), the modem replies normally and the
+	 * raw QMI WWAN port is functional and required by ModemManager's
+	 * qcom-soc plugin.  Keep the upstream behaviour.
+	 */
+	return false;
+}
+
+static void mhi_wwan_dbg_dump(struct mhi_wwan_dev *mhiwwan, const char *tag,
+			      const void *buf, size_t len, unsigned int cnt)
+{
+	struct mhi_device *mhi_dev = mhiwwan->mhi_dev;
+	size_t dump_len;
+
+	if (!mhi_wwan_is_qmi(mhiwwan) || cnt >= MHI_WWAN_QMI_DBG_LIMIT || !buf)
+		return;
+
+	dump_len = min(len, (size_t)MHI_WWAN_QMI_DBG_BYTES);
+	dev_info(&mhi_dev->dev, "qmi_dbg[%u] %s len=%zu dump=%zu\n",
+		 cnt, tag, len, dump_len);
+	print_hex_dump(KERN_INFO, "qmi_dbg: ", DUMP_PREFIX_OFFSET, 16, 1,
+		       buf, dump_len, false);
+}
 
 /* Increment RX budget and schedule RX refill if necessary */
 static void mhi_wwan_rx_budget_inc(struct mhi_wwan_dev *mhiwwan)
@@ -109,6 +154,10 @@ static int mhi_wwan_ctrl_start(struct wwan_port *port)
 	struct mhi_wwan_dev *mhiwwan = wwan_port_get_drvdata(port);
 	int ret;
 
+	dev_info(&mhiwwan->mhi_dev->dev,
+		 "mhi_wwan_ctrl_start: opened by comm=%s pid=%d tgid=%d\n",
+		 current->comm, task_pid_nr(current), task_tgid_nr(current));
+
 	/* Start mhi device's channel(s) */
 	ret = mhi_prepare_for_transfer(mhiwwan->mhi_dev);
 	if (ret)
@@ -130,6 +179,11 @@ static void mhi_wwan_ctrl_stop(struct wwan_port *port)
 {
 	struct mhi_wwan_dev *mhiwwan = wwan_port_get_drvdata(port);
 
+	dev_info(&mhiwwan->mhi_dev->dev,
+		 "mhi_wwan_ctrl_stop: closed by comm=%s pid=%d tgid=%d\n",
+		 current->comm, task_pid_nr(current), task_tgid_nr(current));
+	dump_stack();
+
 	spin_lock_bh(&mhiwwan->rx_lock);
 	clear_bit(MHI_WWAN_RX_REFILL, &mhiwwan->flags);
 	spin_unlock_bh(&mhiwwan->rx_lock);
@@ -149,6 +203,9 @@ static int mhi_wwan_ctrl_tx(struct wwan_port *port, struct sk_buff *skb)
 
 	if (!test_bit(MHI_WWAN_UL_CAP, &mhiwwan->flags))
 		return -EOPNOTSUPP;
+
+	mhi_wwan_dbg_dump(mhiwwan, "tx", skb->data, skb->len,
+			  mhiwwan->dbg_tx_cnt++);
 
 	/* Queue the packet for MHI transfer and check fullness of the queue */
 	spin_lock_bh(&mhiwwan->tx_lock);
@@ -175,6 +232,9 @@ static void mhi_ul_xfer_cb(struct mhi_device *mhi_dev,
 
 	dev_dbg(&mhi_dev->dev, "%s: status: %d xfer_len: %zu\n", __func__,
 		mhi_result->transaction_status, mhi_result->bytes_xferd);
+
+	mhi_wwan_dbg_dump(mhiwwan, "tx-complete", skb->data, skb->len,
+			  mhiwwan->dbg_tx_cnt);
 
 	/* MHI core has done with the buffer, release it */
 	consume_skb(skb);
@@ -204,6 +264,8 @@ static void mhi_dl_xfer_cb(struct mhi_device *mhi_dev,
 
 	/* MHI core does not update skb->len, do it before forward */
 	skb_put(skb, mhi_result->bytes_xferd);
+	mhi_wwan_dbg_dump(mhiwwan, "rx", skb->data, skb->len,
+			  mhiwwan->dbg_rx_cnt++);
 	wwan_port_rx(port, skb);
 
 	/* Do not increment rx budget nor refill RX buffers now, wait for the
@@ -218,12 +280,20 @@ static int mhi_wwan_ctrl_probe(struct mhi_device *mhi_dev,
 	struct mhi_wwan_dev *mhiwwan;
 	struct wwan_port *port;
 
+	if (mhi_wwan_skip_raw_qmi(mhi_dev, id)) {
+		dev_info(&mhi_dev->dev,
+			 "skipping raw QMI WWAN port on %s\n",
+			 cntrl->name ?: "unknown-controller");
+		return -ENODEV;
+	}
+
 	mhiwwan = kzalloc(sizeof(*mhiwwan), GFP_KERNEL);
 	if (!mhiwwan)
 		return -ENOMEM;
 
 	mhiwwan->mhi_dev = mhi_dev;
 	mhiwwan->mtu = MHI_WWAN_MAX_MTU;
+	mhiwwan->is_qmi = id->driver_data == WWAN_PORT_QMI;
 	INIT_WORK(&mhiwwan->rx_refill, mhi_wwan_ctrl_refill_work);
 	spin_lock_init(&mhiwwan->tx_lock);
 	spin_lock_init(&mhiwwan->rx_lock);
@@ -262,6 +332,7 @@ static const struct mhi_device_id mhi_wwan_ctrl_match_table[] = {
 	{ .chan = "MBIM", .driver_data = WWAN_PORT_MBIM },
 	{ .chan = "QMI", .driver_data = WWAN_PORT_QMI },
 	{ .chan = "DIAG", .driver_data = WWAN_PORT_QCDM },
+	{ .chan = "EFS", .driver_data = WWAN_PORT_EFS },
 	{ .chan = "FIREHOSE", .driver_data = WWAN_PORT_FIREHOSE },
 	{},
 };

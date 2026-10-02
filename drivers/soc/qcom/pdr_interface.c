@@ -76,6 +76,18 @@ static int pdr_locator_new_server(struct qmi_handle *qmi,
 	struct pdr_handle *pdr = container_of(qmi, struct pdr_handle,
 					      locator_hdl);
 
+	if (svc->service != SERVREG_LOCATOR_SERVICE ||
+	    svc->version != 1 || svc->instance != 1) {
+		pr_info("PDR: ignoring non-locator server service=%u version=%u instance=%u node=%u port=%u\n",
+			svc->service, svc->version, svc->instance,
+			svc->node, svc->port);
+		return 0;
+	}
+
+	pr_info("PDR: locator server service=%u version=%u instance=%u node=%u port=%u\n",
+		svc->service, svc->version, svc->instance,
+		svc->node, svc->port);
+
 	mutex_lock(&pdr->lock);
 	/* Create a local client port for QMI communication */
 	pdr->locator_addr.sq_family = AF_QIPCRTR;
@@ -96,6 +108,14 @@ static void pdr_locator_del_server(struct qmi_handle *qmi,
 {
 	struct pdr_handle *pdr = container_of(qmi, struct pdr_handle,
 					      locator_hdl);
+
+	if (svc->service != SERVREG_LOCATOR_SERVICE ||
+	    svc->version != 1 || svc->instance != 1) {
+		pr_info("PDR: ignoring non-locator del_server service=%u version=%u instance=%u node=%u port=%u\n",
+			svc->service, svc->version, svc->instance,
+			svc->node, svc->port);
+		return;
+	}
 
 	mutex_lock(&pdr->lock);
 	pdr->locator_init_complete = false;
@@ -361,6 +381,9 @@ static int pdr_get_domain_list(struct servreg_get_domain_list_req *req,
 		return ret;
 
 	mutex_lock(&pdr->lock);
+	pr_info("PDR: get_domain_list service=\"%s\" offset_valid=%u offset=%u dst=%u:%u\n",
+		req->service_name, req->domain_offset_valid, req->domain_offset,
+		pdr->locator_addr.sq_node, pdr->locator_addr.sq_port);
 	ret = qmi_send_request(&pdr->locator_hdl,
 			       &pdr->locator_addr,
 			       &txn, SERVREG_GET_DOMAIN_LIST_REQ,

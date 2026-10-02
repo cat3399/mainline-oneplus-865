@@ -112,6 +112,34 @@ TRACE_EVENT(qrtr_ns_message,
 	)
 );
 
+TRACE_EVENT(qrtr_ns_lookup,
+
+	TP_PROTO(const char * const op, __u32 sq_node, __u32 sq_port,
+		 __u32 service, __u32 instance),
+
+	TP_ARGS(op, sq_node, sq_port, service, instance),
+
+	TP_STRUCT__entry(
+		__string(op, op)
+		__field(__u32, sq_node)
+		__field(__u32, sq_port)
+		__field(__u32, service)
+		__field(__u32, instance)
+	),
+
+	TP_fast_assign(
+		__assign_str(op);
+		__entry->sq_node = sq_node;
+		__entry->sq_port = sq_port;
+		__entry->service = service;
+		__entry->instance = instance;
+	),
+
+	TP_printk("%s from %d:%d service=%u instance=%u",
+		  __get_str(op), __entry->sq_node, __entry->sq_port,
+		  __entry->service, __entry->instance)
+);
+
 #endif /* _TRACE_QRTR_H */
 
 /* This part must be outside protection */

@@ -603,6 +603,7 @@ static struct qcom_pdm_data *qcom_pdm_start(void)
 {
 	const struct qcom_pdm_domain_data * const *domains;
 	const struct of_device_id *match;
+	struct device_node *ext_mdm;
 	struct qcom_pdm_data *data;
 	struct device_node *root;
 	int ret, i;
@@ -615,6 +616,20 @@ static struct qcom_pdm_data *qcom_pdm_start(void)
 	of_node_put(root);
 	if (!match) {
 		pr_notice("PDM: no support for the platform, userspace daemon might be required.\n");
+		return ERR_PTR(-ENODEV);
+	}
+
+	/*
+	 * Fusion platforms with an external PCIe modem use vendor userspace
+	 * pd-mapper to expose modem-specific protection domains. The generic
+	 * in-kernel sm8250 table does not describe those modem PDs, so serving
+	 * locator requests here can hide the userspace mapper and return
+	 * incomplete domain lists to the modem.
+	 */
+	ext_mdm = of_find_compatible_node(NULL, NULL, "qcom,ext-sdx55m");
+	if (ext_mdm) {
+		of_node_put(ext_mdm);
+		pr_notice("PDM: external modem platform detected, deferring to userspace pd-mapper.\n");
 		return ERR_PTR(-ENODEV);
 	}
 

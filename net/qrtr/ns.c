@@ -399,13 +399,22 @@ static int ctrl_cmd_del_client(struct sockaddr_qrtr *from,
 	iv.iov_base = &pkt;
 	iv.iov_len = sizeof(pkt);
 
-	/* Don't accept spoofed messages */
-	if (from->sq_node != node_id)
-		return -EINVAL;
-
 	/* Local DEL_CLIENT messages comes from the port being closed */
-	if (from->sq_node == qrtr_ns.local_node && from->sq_port != port)
-		return -EINVAL;
+	if (from->sq_node == qrtr_ns.local_node) {
+		if (from->sq_port != port)
+			return -EINVAL;
+	} else if (from->sq_node != node_id) {
+		/*
+		 * Allow remote nodes to send DEL_CLIENT for ports on a
+		 * different node.  Qualcomm modems with multiple PDs (e.g.
+		 * SDX55 root PD on node 2 cleaning up user PD on node 3)
+		 * rely on the nameserver propagating these cross-node
+		 * DEL_CLIENT messages.  The vendor userspace qrtr-ns did
+		 * not have this anti-spoofing check.
+		 */
+		pr_debug("qrtr: cross-node DEL_CLIENT from %d for [%d:%d]\n",
+			 from->sq_node, node_id, port);
+	}
 
 	/* Remove any lookups by this client */
 	list_for_each_safe(li, tmp, &qrtr_ns.lookups) {
@@ -658,11 +667,19 @@ static void qrtr_ns_worker(struct work_struct *work)
 		case QRTR_TYPE_RESUME_TX:
 			break;
 		case QRTR_TYPE_NEW_LOOKUP:
+			trace_qrtr_ns_lookup("new-lookup",
+					     sq.sq_node, sq.sq_port,
+					     le32_to_cpu(pkt->server.service),
+					     le32_to_cpu(pkt->server.instance));
 			ret = ctrl_cmd_new_lookup(&sq,
 					 le32_to_cpu(pkt->server.service),
 					 le32_to_cpu(pkt->server.instance));
 			break;
 		case QRTR_TYPE_DEL_LOOKUP:
+			trace_qrtr_ns_lookup("del-lookup",
+					     sq.sq_node, sq.sq_port,
+					     le32_to_cpu(pkt->server.service),
+					     le32_to_cpu(pkt->server.instance));
 			ctrl_cmd_del_lookup(&sq,
 				    le32_to_cpu(pkt->server.service),
 				    le32_to_cpu(pkt->server.instance));
