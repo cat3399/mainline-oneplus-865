@@ -10,6 +10,69 @@
 	model = "OnePlus 8T";
 	compatible = "oneplus,kebab", "qcom,sm8250";
 
+	reserved-memory {
+		xbl-uefi-log@80880000 {
+			reg = <0 0x80880000 0 0x14000>;
+			no-map;
+		};
+
+		/*
+		 * Keep the downstream firmware window out of the page allocator,
+		 * including the gaps between PIL regions. Leave the existing
+		 * remoteproc carveouts and their consumers at their board addresses.
+		 */
+		fw-guard@8ba00000 {
+			reg = <0 0x8ba00000 0 0x500000>;
+			no-map;
+		};
+
+		fw-guard@8bf00000 {
+			reg = <0 0x8bf00000 0 0x61c000>;
+			no-map;
+		};
+
+		fw-guard@8c51c000 {
+			reg = <0 0x8c51c000 0 0xe4000>;
+			no-map;
+		};
+
+		fw-guard@8c600000 {
+			reg = <0 0x8c600000 0 0x1600000>;
+			no-map;
+		};
+
+		fw-guard@8e21c000 {
+			reg = <0 0x8e21c000 0 0xe4000>;
+			no-map;
+		};
+
+		/* OEM display data, bootloader log, persistent log and param/MTP. */
+		fw-guard@9e300000 {
+			reg = <0 0x9e300000 0 0x100000>;
+			no-map;
+		};
+
+		fw-guard@9fff7000 {
+			reg = <0 0x9fff7000 0 0x9000>;
+			no-map;
+		};
+
+		fw-guard@a9800000 {
+			compatible = "ramoops";
+			reg = <0 0xa9800000 0 0x400000>;
+			record-size = <0x40000>;
+			console-size = <0x40000>;
+			ftrace-size = <0x40000>;
+			pmsg-size = <0x200000>;
+			no-map;
+		};
+
+		fw-guard@ac200000 {
+			reg = <0 0xac200000 0 0xc00000>;
+			no-map;
+		};
+	};
+
 	/* Alternative stock BOMs: each input depends only on its own Hall pair. */
 	hall-slider {
 		compatible = "dual-hall-slider";
